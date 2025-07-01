@@ -21,7 +21,7 @@ class TiltRotorUAV:
             'b': 1.4224,
             'c': 0.3305,
             'es': 0.9,
-            #'AR': 1.4224**2 / 0.2589,
+            'AR': 1.4224**2 / 0.2589, #Aspect Ratio b^2 / S
 
             # Front motor parameters
             'Vmax_front': 11.1,
@@ -105,7 +105,11 @@ class TiltRotorUAV:
     def compute_aerodynamic_forces(self, va, omega, delta_e):
         rho, S, b, c = self.params['rho'], self.params['S'], self.params['b'], self.params['c']
         alpha = np.arctan2(va[2], va[0])
-        beta = np.arcsin(va[1] / np.linalg.norm(va))
+        va_norm = np.linalg.norm(va)
+        if va_norm < 1e-6:
+            beta = 0.0
+        else:
+            beta = np.arcsin(va[1] / va_norm)
         R_alpha_mat = self.R_alpha(alpha)
         
         #based on equation (13)
@@ -135,7 +139,10 @@ class TiltRotorUAV:
     def compute_aerodynamic_moments(self, va, omega, delta_e):
         rho, S, b, c = self.params['rho'], self.params['S'], self.params['b'], self.params['c']
         alpha = np.arctan2(va[2], va[0])
-        beta = np.arcsin(va[1] / np.linalg.norm(va))
+        if np.linalg.norm(va) < 1e-6:
+            beta = 0.0
+        else:
+            beta = np.arcsin(va[1] / np.linalg.norm(va))
 
         # based on equation (8)
         M0 = 0.5 * rho * np.linalg.norm(va)**2 * S * np.array([
@@ -281,6 +288,12 @@ class TiltRotorUAV:
         """
         x = UAVStateQuat.from_vector(x_vec)
         u = u_func(t, x)
+        
+        norm_q = np.linalg.norm(x.quat)
+        if norm_q > 1e-8:
+            x.quat = x.quat / norm_q
+        else:
+            x.quat = np.array([1.0, 0.0, 0.0, 0.0])  # fallback
 
         # Assume a control input format: [delta_e1, delta_r1, delta_r2, delta_r3, theta_cmd1, theta_cmd2]
         # e.g. u = np.array([...]) with shape (6,)
@@ -310,6 +323,7 @@ class TiltRotorUAV:
         F = self.compute_total_force(v, omega, delta_e, delta_r, theta_r, q_rotors)
         dv = g_b + F / self.params['mass'] - np.cross(omega, v)  # Eq. (2)
         dquat = self.quaternion_derivative(quat, omega)         # Eq. (3)
+        
         domega = self.compute_omega_dot(omega,
                     self.compute_total_moment(v, omega, delta_e, delta_r, theta_r, q_rotors))  # Eq. (4)
         dtheta = self.compute_theta_dot(theta, theta_cmd, ks=5.0)  # Eq. (6)
