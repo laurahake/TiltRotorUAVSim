@@ -2,11 +2,83 @@ import numpy as np
 import scipy.integrate as spi
 from scipy.spatial.transform import Rotation
 
+
+class UAVStateQuat:
+    def __init__(self, 
+                 p=np.zeros(3), 
+                 v=np.zeros(3), 
+                 quat=np.array([0, 0, 0, 1]),  # [x, y, z, w]
+                 omega=np.zeros(3), 
+                 theta=np.zeros(2)):
+        """
+        UAV full nonlinear state (quaternion-based).
+        - p: position in inertial frame (3,)
+        - v: velocity in body frame (3,)
+        - quat: orientation as quaternion [x, y, z, w]
+        - omega: angular velocity in body frame (3,)
+        - theta: front rotor servo angles (2,)
+        """
+        self.p = p.astype(float)
+        self.v = v.astype(float)
+        self.quat = quat.astype(float)  # unit quaternion
+        self.omega = omega.astype(float)
+        self.theta = theta.astype(float)
+
+    def as_vector(self):
+        """Flatten the state to a 1D numpy array (15,)"""
+        return np.concatenate([
+            self.p,      # 3
+            self.v,      # 3
+            self.quat,   # 4
+            self.omega,  # 3
+            self.theta   # 2
+        ])
+
+    @classmethod
+    def from_vector(cls, vec):
+        """Reconstruct state from a 1D array of shape (15,)"""
+        assert len(vec) == 15
+        p = vec[0:3]
+        v = vec[3:6]
+        quat = vec[6:10]
+        omega = vec[10:13]
+        theta = vec[13:15]
+        return cls(p, v, quat, omega, theta)
+
+    @classmethod
+    def from_reduced_vector(cls, vec):
+            """
+            Reconstruct a UAVStateQuat-like object from a 9D vector:
+            [px, py, pz, vx, vy, vz, wx, wy, wz]
+            """
+            assert len(vec) == 9
+
+            obj = cls()
+            obj.p = vec[0:3]
+            obj.v = vec[3:6]
+            obj.omega = vec[6:9]
+
+            # Leave quat and theta at defaults (they're not used in linearization)
+            return obj
+
+    def rotation_matrix(self):
+        """Return the rotation matrix corresponding to the current quaternion"""
+        return Rotation.from_quat(self.quat).as_matrix()
+
+    def normalize_quat(self):
+        """Ensure the quaternion stays normalized"""
+        self.quat = self.quat / np.linalg.norm(self.quat)
+        
+    @staticmethod
+    def rotation_to_vector(R):
+        """Convert a rotation matrix to a rotation vector (Lie algebra so(3))"""
+        return Rotation.from_matrix(R).as_rotvec()
+
+
 class TiltRotorUAV:
     def __init__(self, params=None):
         self.state = UAVStateQuat()
         self.params = params or self.default_params()
-        
         
     def default_params(self):
         """Default parameters for the UAV."""
@@ -178,6 +250,8 @@ class TiltRotorUAV:
         c = rho * D**3 * CQ2 * va_i**2 - (KQ / Rm) * (Vmax * delta_r) + KQ * I0
 
         omega = (-b + np.sqrt(b**2 - 4 * a * c)) / (2 * a)
+        if np.isnan(omega) or np.isinf(omega):
+            print("Invalid omega calculation")
         
         # based on equation (19)
         Tp = (rho * D**4 * CT0 / (4 * np.pi**2)) * omega**2 + \
@@ -227,6 +301,10 @@ class TiltRotorUAV:
 
             s = np.array([np.cos(theta), 0, -np.sin(theta)])
             vai = va @ s
+            if abs(vai) < 1e-3:
+                print(f"[Warning] va_i too small: {vai}, setting to 1e-3")
+                vai = 1e-3
+            delta_r = np.maximum(delta_r, 1e-6) # replace small delta_r with 1e-6 to avoid division by zero
             Tp, Qp = self.propeller_thrust_torque(delta_r[i], vai, D, KQ, Rm, I0, Vmax, CT, CQ)
 
             q = q_rotors[i]  # position of rotor in body frame
@@ -332,52 +410,47 @@ class TiltRotorUAV:
     
     
     
-class UAVStateQuat:
-    def __init__(self, 
-                 p=np.zeros(3), 
-                 v=np.zeros(3), 
-                 quat=np.array([0, 0, 0, 1]),  # [x, y, z, w]
-                 omega=np.zeros(3), 
-                 theta=np.zeros(2)):
+    def simplified_derivatives(self, x: UAVStateQuat, u):
         """
-        UAV full nonlinear state (quaternion-based).
-        - p: position in inertial frame (3,)
-        - v: velocity in body frame (3,)
-        - quat: orientation as quaternion [x, y, z, w]
-        - omega: angular velocity in body frame (3,)
-        - theta: front rotor servo angles (2,)
-        """
-        self.p = p.astype(float)
-        self.v = v.astype(float)
-        self.quat = quat.astype(float)  # unit quaternion
-        self.omega = omega.astype(float)
-        self.theta = theta.astype(float)
+        Implements the simplified dynamics from Equation (42) in the paper.
 
-    def as_vector(self):
-        """Flatten the state to a 1D numpy array (15,)"""
-        return np.concatenate([
-            self.p,      # 3
-            self.v,      # 3
-            self.quat,   # 4
-            self.omega,  # 3
-            self.theta   # 2
+        Args:
+            x: UAVStateQuat state [p, v, quat, omega, theta]
+            u: control input [a_x, a_z, ω_x, ω_y, ω_z]
+
+        Returns:
+            np.array: derivative of simplified state [dp, dv, dR (flattened)] of the dimension 15.
+            When computing the error state and linearizing, this state has to be converted to a 9D vector
+        """
+        # Unpack state
+        p = x.p
+        v = x.v
+        R = x.rotation_matrix()
+
+        # Control inputs
+        a_body = np.array([u[0], 0, u[1]])  # simplified body-frame acceleration
+        omega = np.array(u[2:5])            # instantaneous angular velocities
+
+        # Constants
+        g = self.params['gravity']
+        mass = self.params['mass']
+        e3 = np.array([0.0, 0.0, 1.0])
+
+        # Simplified dynamics (Equation 42 from the paper)
+        dp = R @ v
+        dv = np.cross(omega, v) + R.T @ (g * e3) + a_body
+        dR = R @ self.skew(omega)
+
+        # Flatten rotation matrix derivative
+        dR_flat = dR.flatten()
+
+        return np.concatenate([dp, dv, dR_flat])
+
+    @staticmethod
+    def skew(w):
+        """ Returns skew-symmetric matrix for vector w """
+        return np.array([
+            [0, -w[2], w[1]],
+            [w[2], 0, -w[0]],
+            [-w[1], w[0], 0]
         ])
-
-    @classmethod
-    def from_vector(cls, vec):
-        """Reconstruct state from a 1D array of shape (15,)"""
-        assert len(vec) == 15
-        p = vec[0:3]
-        v = vec[3:6]
-        quat = vec[6:10]
-        omega = vec[10:13]
-        theta = vec[13:15]
-        return cls(p, v, quat, omega, theta)
-
-    def rotation_matrix(self):
-        """Return the rotation matrix corresponding to the current quaternion"""
-        return Rotation.from_quat(self.quat).as_matrix()
-
-    def normalize_quat(self):
-        """Ensure the quaternion stays normalized"""
-        self.quat = self.quat / np.linalg.norm(self.quat)
