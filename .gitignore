@@ -1,6 +1,8 @@
 .vscode/launch.json
 .vscode/settings.json
+plot.py
 *.cpyt
 *.pyc
 *.pkl
 *.png
+*.npy

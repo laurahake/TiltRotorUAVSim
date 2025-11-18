@@ -79,8 +79,8 @@ class LowLevelControl:
         for i in range(delta.shape[0]):
             delta[i] = self.sat(delta.item(i), self.limits.item(0,i), self.limits.item(1,i))
 
-        self.output.elevator =  delta.item(6) + delta.item(5)
-        self.output.aileron = delta.item(6) - delta.item(5)
+        self.output.elevator =  delta.item(6) + delta.item(5) #elevon right + elevon left
+        self.output.aileron = delta.item(6) - delta.item(5) #elevon right - elevon left
         self.output.rudder = np.radians(0.0)  
         self.output.throttle_right = delta.item(1) 
         self.output.throttle_left = delta.item(2)

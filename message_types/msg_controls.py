@@ -28,4 +28,18 @@ class MsgControls:
         self.throttle_left = float(0.0) 
         self.servo_right = np.radians(0.0)
         self.servo_left = np.radians(0.0)
+        
+    def extract_as_array(self):
+        '''
+            Return the control inputs as a numpy array
+            in the order: [throttle_rear, throttle_left, throttle_right, elevon_left, elevon_right, servo_right, servo_left]
+        '''
+        return np.array([self.throttle_rear,
+                         self.throttle_left,
+                         self.throttle_right,
+                         self.elevon_left,
+                         self.elevon_right,
+                         self.servo_right,
+                         self.servo_left], dtype=np.float32)
+            
 
