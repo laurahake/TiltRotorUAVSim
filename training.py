@@ -1,12 +1,18 @@
 import os, sys, random
 from pathlib import Path
-sys.path.insert(0,os.fspath(Path(__file__).parents[1]))
+sys.path.insert(0, os.fspath(Path(__file__).parents[1]))
+
 import numpy as np
+import torch
+import math
+import csv
+from pathlib import Path
 
 from models.vtol_dynamics import VtolDynamics
 import parameters.simulation_parameters as SIM
 from models.vtol_dynamics_adapter import VtolDynamicsAdapter
-from tools.icnn_policy import ICNNPolicy
+from tools.policy import ICNNPolicy, PolicyConfig
+from tools.iccn_value import ICNNValue
 from message_types.msg_delta import MsgDelta
 from message_types.msg_controls import MsgControls
 from controllers.tiltrotor_control import TiltRotorSwitcher, TiltConfig
@@ -14,14 +20,16 @@ from controllers.tiltrotor_control import TiltRotorSwitcher, TiltConfig
 # ---- Parameters ----
 T_steps: int = 200
 r_u: float = 1e-2           # r * ||u||^2
-q_pos: tuple = (1.0, 1.0, 1.0)  # diag(Q) für Positionsfehler
+q_pos: tuple = (1.0, 1.0, 1.0)  # diag(Q) for position error
 gamma: float = 0.99         # discount factor
 
 u_min = np.array([0.0, 0.0, 0.0, -0.785398, -0.785398], dtype=np.float32)
 u_max = np.array([1.0, 1.0, 1.0,  0.785398,  0.785398], dtype=np.float32)
 idx_fast = [0,1,2,3,4]     # thr_rear, thr_left, thr_right, elevon_left, elevon_right
 
-# sample K random pairs of initial states and reference states
+# ===============================================================
+#  State Sampling
+# ===============================================================
 def sample_initial_and_reference_states(K, state_dim=15, rng=None):
     """
     Returns: list of (init_state, ref_state) tuples, length K.
@@ -60,7 +68,16 @@ def sample_initial_and_reference_states(K, state_dim=15, rng=None):
 
     return pairs
 
-# ---- Helpers ---- 
+
+# ===============================================================
+#  Utility
+# ===============================================================
+def seed_all(seed):
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+
+
 def pack_full_controls(u_fast_np, tilt_right, tilt_left):
     out = MsgControls()
     out.throttle_rear  = float(u_fast_np[0])
@@ -72,214 +89,350 @@ def pack_full_controls(u_fast_np, tilt_right, tilt_left):
     out.servo_left     = float(tilt_left)   # from slow controller
     return out
 
-def seed_all(seed):
-    np.random.seed(seed)
-    random.seed(seed)
 
-def euler_discretize(Ac, Bc, bc, dt):
-    n = Ac.shape[0]
-    Ad = np.eye(n) + dt*Ac
-    Bd = dt*Bc
-    cd = dt*bc
-    return Ad, Bd, cd
+def Q_hat_trajectory(policy, x0_np, xref_np, u0_override_np,
+                     Qp, R, T=50, gamma=0.99, dt=SIM.ts_simulation):
+    """
+    Simulate trajectory under policy starting from x0_np to approximate
+    our Action-Value function Q_hat(x0, u0_override_np)=∑ γ^t c(x_t, u_t).
+    """
+    # 1) Initialize simulation
+    vtol = VtolDynamics(dt)
+    vtol.external_set_state(x0_np.reshape(-1, 1))
+
+    tilt_cfg = TiltConfig(trigger_height_m=2.0,
+                              hysteresis_m=0.5,
+                              transition_time_s=3.0,
+                              vertical_angle=math.pi/2,
+                              forward_angle=0.0,
+                              angle_min=0.0,
+                              angle_max=math.radians(115.0))
     
-def linearize_fd(f, x0, u0, eps=1e-5):
-    u0_vector = u0.extract_as_array()
-    n = x0.size
-    m = u0_vector.size
-    f0 = f(x0, u0_vector)
-    A = np.zeros((n,n))
-    B = np.zeros((n,m))
-    for i in range(n):
-        dx = np.zeros_like(x0); dx[i] = eps
-        A[:, i] = (f(x0+dx, u0_vector) - f(x0-dx, u0_vector)) / (2*eps)
-    for j in range(m):
-        du = np.zeros_like(u0_vector); du[j] = eps
-        B[:, j] = (f(x0, u0_vector+du) - f(x0, u0_vector-du)) / (2*eps)
-    b = f0 - A @ x0 - B @ u0_vector
-    return A, B, b
-
-
-def rollout(policy, seed, init_state, ref_state):
-    seed_all(seed)
-
-    # --- Reset dynamics and setup ---
-    vtol = VtolDynamics(SIM.ts_simulation)
-    vtol.external_set_state(init_state)
-    adapter = VtolDynamicsAdapter(vtol)
+    tilt_switcher = TiltRotorSwitcher(tilt_cfg)
     wind = np.zeros((6, 1), dtype=np.float32)
-    u_prev = np.zeros(u_min.shape[0], dtype=np.float32)
 
-    # --- Cost weights (position-only) ---
-    Qp = np.diag(q_pos).astype(np.float32)
-    r  = float(r_u)
-    gamma_val = float(gamma)
+    total_return = 0.0
+    discount = 1.0
 
-    # --- Simulation bookkeeping ---
-    Q_sum = 0.0
-    sim_time = SIM.start_time
-    steps = 0
-
-    # --- Tilt control configuration ---
-    tilt_cfg = TiltConfig(trigger_height_m=12.0, transition_time_s=3.0)
-    tilt_ctrl = TiltRotorSwitcher(tilt_cfg)
-
-    while steps < T_steps and sim_time < SIM.end_time:
-        # 1) Current state
-        xk = vtol._state.squeeze().astype(np.float32)
+    # 2) First action: SPSA-perturbed u0
+    u_np = u0_override_np.copy()
+    
+    for t in range(T):
+        # ---- Current state ----
+        xk = vtol._state.reshape(-1)
         
-        # check for inf in state
-        if not np.all(np.isfinite(xk)):
-            print(f"[rollout] Non-finite state at step {steps}, aborting. xk =", xk)
-            # large penalty
-            Q_sum += 1e6
-            break
+        # ---- Servo angles (tilt rotors) ----
+        d_down = xk[2]
+        tilt_right, tilt_left = tilt_switcher.step_ned(d_down, dt)
         
-        d_down = xk[2]  # NED Down position
-        tilt_right, tilt_left = tilt_ctrl.step_ned(d_down, SIM.ts_simulation)
+        # ---- Build reference state for this step ----
+        xref_step = xref_np.copy()
+        xref_step[13] = tilt_right
+        xref_step[14] = tilt_left
 
-        # 2) Reference (desired position trajectory)
-        xref = ref_state.copy()
-        xref[13] = tilt_right
-        xref[14] = tilt_left
-
-        # 3) Linearize and discretize dynamics
-        u_prev_full = pack_full_controls(u_prev, tilt_right, tilt_left)
-        Ac, Bc_full, bc = linearize_fd(adapter.f, xk, u_prev_full)
-        Ad, Bd_full, cd = euler_discretize(Ac, Bc_full, bc, SIM.ts_simulation)
-        Bd = Bd_full[:, idx_fast]
+        # ---- Stage cost ----
+        epos = xk[:3] - xref_step[:3]
+        stage_cost = float(epos.T @ Qp @ epos + u_np @ (R @ u_np))
+        total_return += discount * stage_cost
+        discount *= gamma
         
-        Qp=np.diag(q_pos).astype(np.float32) # shape (3,3)
+        # ---- Build control message ----
+        ctrl = pack_full_controls(u_np, tilt_right, tilt_left)
+        delta = MsgDelta(ctrl)
+        wind = np.zeros((6, 1))
 
-        # 4) Compute control via convex policy
-        u_star = policy(
-            xk, xref, Ad, Bd, cd,
-            Qp,
-            r_u * np.eye(policy.nu, dtype=np.float32),
-            gamma_val, u_min, u_max
-        )
-        u_np = np.asarray(u_star, dtype=np.float32).flatten()
-
-        # Check dimensions
-        if u_np.shape[0] != 5:
-            print("Bad u_np shape:", u_np.shape, "prob.status:",
-                  policy.prob.status, "u_star:", u_star)
-        output = pack_full_controls(u_np, tilt_right, tilt_left)
-        
-        # 5) Apply control and propagate dynamics
-        output = pack_full_controls(u_np, tilt_right, tilt_left)
-        delta = MsgDelta(old=output)
+        # ---- Simulate real nonlinear dynamics ----
         vtol.update(delta, wind)
 
-        # 6) Compute stage cost: (p - pref)ᵀ Qp (p - pref) + r‖u‖²
-        p = xk[0:3]
-        p_ref = xref[0:3]
-        epos = p - p_ref
-        stage_cost = epos.T @ Qp @ epos + r * float(u_np.T @ u_np)
+        # ---- Next action via optimal controller ----
+        if t < T - 1:           # if not last time step
 
-        Q_sum += (gamma_val ** steps) * stage_cost
+            # Compute optimal next control
+            u_np = policy.forward_eval(
+                torch.tensor(xk, dtype=torch.float32),
+                torch.tensor(xref_step, dtype=torch.float32)
+            ).cpu().numpy()
 
-        # 7) Update loop variables
-        u_prev = u_np
-        sim_time += SIM.ts_simulation
-        steps += 1
+    return float(total_return)
 
-    return Q_sum
 
-# ---- SPSA Training loop ----
+# ---- Training Functions ----
+def compute_grad_u_spsa(policy, x0_np, xref_np, u_star_np, 
+                        Qp, R, T_steps, gamma, c_k):
+    """
+    Computes SPSA approximation of ∇_u Q_hat(x0, u_star).
+    """
 
-def spsa_train(policy, K=8, iters=10, seed=1, alpha=0.501, a = 0.0000001, A= 100, c=0.001, gamma_s=0.11):
-    rng=np.random.default_rng(seed)
-    
-    pairs = sample_initial_and_reference_states(K, rng=rng)
-    
-    psi = policy.get_params()
-    print("psi0 min/max/mean:", psi.min(), psi.max(), psi.mean())
-    p= psi.size
-    
-    history = []
+    # 1. Sample Rademacher ±1 vector
+    Delta_u = np.random.choice([-1.0, 1.0], size=u_star_np.shape)
+
+    # 2) Perturbed actions
+    u_plus  = u_star_np + c_k * Delta_u
+    u_minus = u_star_np - c_k * Delta_u
+
+    # 3) Evaluate Q_hat(x, u) via Rollouts
+    R_plus = Q_hat_trajectory(policy, x0_np, xref_np,
+                              u_plus, Qp, R, T_steps, gamma)
+
+    R_minus = Q_hat_trajectory(policy, x0_np, xref_np,
+                               u_minus, Qp, R, T_steps, gamma)
+
+    # 4) SPSA gradient estimate
+    grad_u_np = ((R_plus - R_minus) / (2 * c_k)) * Delta_u
+
+    # convert to torch
+    return grad_u_np
+
+def spsa_train(policy, Qp, R, T_steps, iters=20, K = 8, seed=1,
+               c=0.1, a=1e-3, alpha=0.501, A=100, gamma=0.99, device="cpu"):
+    """
+    Train the ICNN policy:
+    - exact gradient w.r.t. ψ via CVXPYLayer (autograd)
+    - SPSA only in u-space via Q_hat_trajectory
+    """
+    seed_all(seed)
+
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+
+    log_path = log_dir / "train_log.csv"
+
+    with open(log_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "iter",
+            "loss_mean",
+            "Q_hat_mean",
+            "grad_u_norm",
+            "grad_u_max",
+            "a_k",
+            "c_k",
+            "u_mean",
+            "param_norm",
+        ])
+
     for k in range(iters):
-        # step size and pertubation size sequences
-        a_k = a / ((k + 1 + A) ** alpha)
-        c_k = c / ((k + 1) ** gamma_s)
+        losses = []
+        Q_hats = []
+        grad_u_norms = []
+        grad_u_maxs = []
+        u_means = []
+        
+        # --- Step sizes ---
+        c_k = c / ((k+1)**0.11)
+        a_k = a / ((k+1 + A)**alpha)
+        
+        # --- reset gradients ---
+        for p in policy.parameters():
+            if p.grad is not None:
+                p.grad.zero_()
+        
+        losses = []
 
-        # Rademacher
-        Delta = rng.choice([-1.0, 1.0], size=p)
-        
-        # two perturbations
-        psi_plus  = psi + c_k * Delta
-        psi_minus = psi - c_k * Delta
-    
-        # ---- Evaluate J(ψ⁺) ----
-        policy.set_params(psi_plus)
-        J_plus = 0.0
-        for i, (x0, xref) in enumerate(pairs):
-            J_plus += rollout(
-                policy,
-                seed=1000 + 37 * k + i,
-                init_state=x0,
-                ref_state=xref,
-            )
-        J_plus /= K
+        # --- Monte Carlo loop ---
+        for x0_np, xref_np in sample_initial_and_reference_states(K):
 
-        # ---- Evaluate J(ψ⁻) ----
-        policy.set_params(psi_minus)
-        J_minus = 0.0
-        for i, (x0, xref) in enumerate(pairs):
-            J_minus += rollout(
+            # Torch-Inputs
+            x0_t = torch.tensor(x0_np, dtype=torch.float32, device=device)
+            xref_t = torch.tensor(xref_np, dtype=torch.float32, device=device)
+            
+            # policy output
+            u_star_t = policy.forward_train(x0_t, xref_t)
+            u_means.append(u_star_t.detach().abs().mean().item())
+            
+            # Estimate ∇_u Q̂(x0, u*) via SPSA using non-differentiable rollouts
+            # detach u* from autograd and treat the resulting gradient as constant.
+            u_star_np = u_star_t.detach().cpu().numpy()
+            grad_u_np = compute_grad_u_spsa(
                 policy,
-                seed=2000 + 41 * k + i,
-                init_state=x0,
-                ref_state=xref,
+                x0_np,
+                xref_np,
+                u_star_np,
+                Qp,
+                R,
+                T_steps,
+                gamma,
+                c_k
             )
-        J_minus /= K
-    
-        # SPSA gradient estimate
-        grad = (J_plus - J_minus) / (2.0 * c_k) * (1.0 / Delta)
-        
-        print("Jp, Jm, diff:", J_plus, J_minus, J_plus - J_minus)
-        print("a_k, c_k:", a_k, c_k)
-        print("grad max/mean:", np.max(grad), np.mean(grad))
-        print("psi before update min/max:", psi.min(), psi.max())
-        
-        # parameter update + projection
-        psi_new = psi - a_k * grad
-        
-        print("psi after update min/max:", psi_new.min(), psi_new.max())
-        print("finite grad?", np.all(np.isfinite(grad)))
-        print("finite psi_new?", np.all(np.isfinite(psi_new)))
-        
-        policy.set_params(psi_new)
-        psi = policy.get_params() 
-    
-        # Logging
-        J_mean = 0.5 * (J_plus + J_minus)
-        history.append(
-            dict(
-                k=k,
-                Jp=J_plus,
-                Jm=J_minus,
-                J=J_mean,
-                a_k=a_k,
-                c_k=c_k,
+            # ---- SPSA diagnostics ----
+            grad_u_norms.append(np.linalg.norm(grad_u_np))
+            grad_u_maxs.append(np.max(np.abs(grad_u_np)))
+            
+            Q_hat = Q_hat_trajectory(
+                policy,
+                x0_np,
+                xref_np,
+                u_star_np,
+                Qp,
+                R,
+                T_steps,
+                gamma
             )
+            Q_hats.append(Q_hat)
+            
+            grad_u_t = torch.tensor(
+                grad_u_np,
+                dtype=u_star_t.dtype,
+                device=u_star_t.device
+            )
+            
+            # Chain rule: loss = u* dot grad_u
+            loss = torch.dot(u_star_t, grad_u_t)
+            
+            # backward
+            loss.backward()
+            losses.append(loss.item())
+        
+        
+        param_norm = 0.0
+        for p in policy.parameters():
+            param_norm += p.data.norm().item() ** 2
+        param_norm = param_norm ** 0.5
+
+
+        # --- Parameter update ---
+        with torch.no_grad():
+            for p in policy.parameters():
+                if p.grad is not None:
+                    p -= a_k * p.grad
+        
+        # --- Logging ---
+        with open(log_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                k,
+                float(np.mean(losses)),
+                float(np.mean(Q_hats)),
+                float(np.mean(grad_u_norms)),
+                float(np.mean(grad_u_maxs)),
+                float(a_k),
+                float(c_k),
+                float(np.mean(u_means)),
+                float(param_norm),
+            ])
+            
+        print(
+            f"[iter {k:03d}] "
+            f"mean loss = {sum(losses) / len(losses):.6f}"
         )
-        print(f"[iter {k:03d}] J ≈ {J_mean:.4f}  (J+={J_plus:.4f}, J-={J_minus:.4f})  "
-              f"a_k={a_k:.3e}, c_k={c_k:.3e}")
 
-    # return final params and training log
-    return psi, history
+
+def main():
+    # -----------------------------
+    # General settings
+    # -----------------------------
+    device = "cpu"
+    torch.set_default_dtype(torch.float32)
+
+    # -----------------------------
+    # Dimensions
+    # -----------------------------
+    nx = 15          # VTOL state dimension
+    nu = 5           # control input dimension
+
+    # -----------------------------
+    # Simulation / discretization
+    # -----------------------------
+    dt = 0.01
+    T_steps = 30
+    gamma = 0.99
+    # -----------------------------
+    # Cost matrices
+    # -----------------------------
+    Qp = np.eye(3, dtype=np.float32) * 10.0
+    r_u = 0.1
+    R = r_u * np.eye(nu, dtype=np.float32)
+
+    # -----------------------------
+    # Control constraints
+    # -----------------------------
+    u_min = np.array([0.0, 0.0, 0.0, -0.785398, -0.785398], dtype=np.float32)
+    u_max = np.array([1.0, 1.0, 1.0,  0.785398,  0.785398], dtype=np.float32)
+
+    # -----------------------------
+    # VTOL dynamics (NumPy + Torch)
+    # -----------------------------
+    vtol = VtolDynamics(ts=dt)
+    adapter = VtolDynamicsAdapter(
+        vtol,
+        dt=dt,
+        device=device
+    )
+
+    dynamics_fn = lambda x, u: adapter.f_disc_torch(x, u)
+
+    # -----------------------------
+    # ICNN Value Function
+    # -----------------------------
+    hidden_dims = [64, 64]
+
+    icnn_value = ICNNValue(
+        input_dim=2 * nx,      # z = [x_next, x_ref]
+        hidden_dims=hidden_dims
+    ).to(device)
+
+    # -----------------------------
+    # Policy configuration
+    # -----------------------------
+    config = PolicyConfig(
+        nx=nx,
+        nu=nu,
+        gamma=gamma,
+        u_min=u_min,
+        u_max=u_max,
+        R=R,
+        device=device,
+        dt=dt,
+    )
+
+    # -----------------------------
+    # Policy
+    # -----------------------------
+    policy = ICNNPolicy(
+        config=config,
+        icnn=icnn_value,
+        dynamics_fn=dynamics_fn
+    ).to(device)
+
+    # -----------------------------
+    # Sanity check (policy forward)
+    # -----------------------------
+    x0_np, xref_np = sample_initial_and_reference_states(1)[0]
+
+    x0_t = torch.tensor(x0_np, dtype=torch.float32)
+    xref_t = torch.tensor(xref_np, dtype=torch.float32)
+
+    u_test = policy.forward_eval(x0_t, xref_t)
+
+    print("Sanity check u*:", u_test)
+    print("Shape:", u_test.shape)
+
+    # -----------------------------
+    # SPSA training (manual update)
+    # -----------------------------
+    spsa_train(
+        policy=policy,
+        Qp=Qp,
+        R=R,
+        T_steps=T_steps,
+        iters=5,
+        K=8,
+        seed=1,
+        c=0.1,
+        a=1e-3,
+        alpha=0.501,
+        A=100,
+        gamma=0.99,
+        device=device,
+    )
+
+    # -----------------------------
+    # Save trained value function
+    # -----------------------------
+    torch.save(icnn_value.state_dict(), "icnn_value.pt")
+    print("Training finished. ICNN value saved.")
+
 
 if __name__ == "__main__":
-    # Create policy
-    nx = 15
-    nu = 5
-    hidden = 64
-    policy = ICNNPolicy(nx, nu, hidden)
-
-    # Train with SPSA
-    psi_final, log = spsa_train(policy, K=8, iters=20, seed=42)
+    main()
     
-    np.save("icnn_psi_final.npy", psi_final)
-    np.save("spsa_training_log.npy", log)
-    print("Training finished. Saved final parameters to icnn_psi_final.npy")

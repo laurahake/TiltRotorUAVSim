@@ -6,3 +6,6 @@ plot.py
 *.pkl
 *.png
 *.npy
+*.pt 
+*.pdf
+*.csv
