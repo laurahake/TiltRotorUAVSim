@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Callable, Optional, Tuple
 
 import numpy as np
 import torch
@@ -11,350 +11,345 @@ import math
 from cvxpylayers.torch import CvxpyLayer
 from controllers.tiltrotor_control import TiltRotorSwitcher, TiltConfig
 
+from tools.iccn_value import CVXICNN2Layer, CVXICNN2LayerParams
 
 Tensor = torch.Tensor
 
 
 @dataclass
 class PolicyConfig:
-    nx: int                     
-    nu: int                    
+    nx: int
+    nu: int
+    ntheta: int                 # dimension of theta input to the ICNN
     gamma: float                # discounting factor
-    u_min: np.ndarray           # control constraints lower bound
-    u_max: np.ndarray           # control constraints upper bound
-    R: np.ndarray               # quadratic cost matrix, shape (nu, nu)
-    dt: float                   # time step (for tilt switcher)
-    device: str = "cpu"         #
+    u_min: np.ndarray
+    u_max: np.ndarray
+    R: np.ndarray               # (nu,nu), PD
+    dt: float                   # time step for tilt switcher
+
+    # ICNN architecture (2-layer)
+    h1: int = 64
+    h2: int = 64
+    relu_penalty: float = 1.0
+    hard_relu: bool = True
+
+    # training / numerics
+    device: str = "cpu"
     dtype: torch.dtype = torch.float32
 
 
-class ICNNPolicy(nn.Module):
+class COCPICNNPolicy(nn.Module):
     """
-    ICNN-based policy with DPP-konform CVXPYLayer-QP-Layer.
+    One-step lookahead convex optimal control policy (COCP) with ICNN value inside CVXPY.
 
-    structure:
+    Solves each step:
+        u* = argmin_u  u^T R u + gamma * V_psi( x_next(u), x_ref, theta )
+        s.t. u_min <= u <= u_max
 
-        1) dynamics:   x_{k+1} = f(x_k, u_k; θ)
-        2) Value:     V(x', x_ref; ψ)  approximated by ICNN
-        3) Gradient:  ∇_{x'} V  via Autograd
-        4) Bu = ∂f/∂u (x_k, u_k) via Autograd (Jacobian)
-        5) g_k = γ * Bu^T ∇_{x'} V   
-        6) QP: u_k* = argmin_u ( u^T R u + g_k^T u )  s.t. u_min ≤ u ≤ u_max
+    where x_next(u) = Ad x + Bd u + cd is an affine surrogate (from linearization + discretization).
 
-    Only R and g_k are Parameters in the QP layer.
-    This makes the problem DPP-compliant.
+    Key properties:
+    - DPP-friendly: ICNN is built with auxiliary variables (per ReLU layer) in CVXPY.
     """
 
     def __init__(
         self,
         config: PolicyConfig,
-        icnn: nn.Module,
-        dynamics_fn: Callable[[Tensor, Tensor], Tensor],
+        dynamics_linearize_discretize_fn: Callable[[Tensor, Tensor, Tensor], Tuple[np.ndarray, np.ndarray, np.ndarray]],
     ) -> None:
         """
         Parameters
         ----------
         config : PolicyConfig
-            Configuration object with dimensions, cost matrix, bounds, etc.
-        icnn : nn.Module
-            ICNN that approximates the Value Function V(x', x_ref).
-            Expects tensor of shape [x_next, x_ref] as input.
-        dynamics_fn : Callable
-            Torch-Function f(x, u) -> x_next.
-            Must be fully differentiable in x and u.
+        dynamics_linearize_discretize_fn :
+            Callable (x, u0, theta) -> (Ad, Bd, cd), all numpy arrays.
+            Must return:
+                Ad: (nx,nx)
+                Bd: (nx,nu)
+                cd: (nx,1) or (nx,)
         """
         super().__init__()
 
         self.cfg = config
-        self.icnn = icnn
-        self.dynamics_fn = dynamics_fn
-
         self.nx = config.nx
         self.nu = config.nu
-        self.gamma = config.gamma
-        self.R = config.R
+        self.ntheta = config.ntheta
+        self.gamma = float(config.gamma)
+
         self.device = torch.device(config.device)
         self.dtype = config.dtype
-        
-        tilt_cfg = TiltConfig(trigger_height_m=2.0,
-                              hysteresis_m=0.5,
-                              transition_time_s=3.0,
-                              vertical_angle=math.pi/2,
-                              forward_angle=0.0,
-                              angle_min=0.0,
-                              angle_max=math.radians(115.0))
-                              
+
+        self.dyn_lin_disc = dynamics_linearize_discretize_fn
+
+        # Tilt switcher (theta provider) – replace later
+        tilt_cfg = TiltConfig(
+            trigger_height_m=2.0,
+            hysteresis_m=0.5,
+            transition_time_s=3.0,
+            vertical_angle=math.pi / 2,
+            forward_angle=0.0,
+            angle_min=0.0,
+            angle_max=math.radians(115.0),
+        )
         self.tilt_switcher = TiltRotorSwitcher(tilt_cfg)
-        self.dt = config.dt
+        self.dt = float(config.dt)
 
-        # Cost matrix R as Torch buffer (constant during training)
-        R_torch = torch.as_tensor(config.R, dtype=self.dtype, device=self.device)
-        assert R_torch.shape == (self.nu, self.nu)
-        self.register_buffer("R_torch", R_torch)
+        # Buffers: bounds + R
+        self.register_buffer("u_min_torch", torch.as_tensor(config.u_min, dtype=self.dtype, device=self.device).view(self.nu, 1))
+        self.register_buffer("u_max_torch", torch.as_tensor(config.u_max, dtype=self.dtype, device=self.device).view(self.nu, 1))
 
-        # Input constraints as Torch tensors
-        self.register_buffer(
-            "u_min_torch",
-            torch.as_tensor(config.u_min, dtype=self.dtype, device=self.device),
-        )
-        self.register_buffer(
-            "u_max_torch",
-            torch.as_tensor(config.u_max, dtype=self.dtype, device=self.device),
-        )
+        R_t = torch.as_tensor(config.R, dtype=self.dtype, device=self.device)
+        assert R_t.shape == (self.nu, self.nu)
+        self.register_buffer("R_torch", R_t)
 
-        # Default nominal input (e.g., zero vector)
-        self.register_buffer(
-            "u_nominal_default",
-            torch.zeros(self.nu, dtype=self.dtype, device=self.device),
-        )
+        # Default linearization input u0
+        self.register_buffer("u_nominal_default", torch.zeros(self.nu, dtype=self.dtype, device=self.device).view(self.nu, 1))
 
-        # Define the QP layer (DPP-compliant!)
-        self._build_qp_layer()
+        # ----- Trainable ICNN parameters (psi) as torch.nn.Parameter -----
+        # These are passed into cvxpylayers as Parameters -> gradients flow into them.
+        input_dim = 2 * self.nx + self.ntheta
+        self.h1 = int(config.h1)
+        self.h2 = int(config.h2)
+
+        # Layer 1: y1 = W1 s + b1
+        self.W1 = nn.Parameter(0.01 * torch.randn(self.h1, input_dim, device=self.device, dtype=self.dtype))
+        self.b1 = nn.Parameter(torch.zeros(self.h1, 1, device=self.device, dtype=self.dtype))
+
+        # Layer 2: y2 = W2z z1 + W2x s + b2
+        # ICNN-style: W2z >= 0 (enforced by projection)
+        self.W2z = nn.Parameter(0.01 * torch.randn(self.h2, self.h1, device=self.device, dtype=self.dtype))
+        self.W2x = nn.Parameter(0.01 * torch.randn(self.h2, input_dim, device=self.device, dtype=self.dtype))
+        self.b2  = nn.Parameter(torch.zeros(self.h2, 1, device=self.device, dtype=self.dtype))
+
+        # Output: V = Woutz z2 + Woutx s + bout
+        # ICNN-style: Woutz >= 0 (enforced by projection)
+        self.Woutz = nn.Parameter(0.01 * torch.randn(1, self.h2, device=self.device, dtype=self.dtype))
+        self.Woutx = nn.Parameter(0.01 * torch.randn(1, input_dim, device=self.device, dtype=self.dtype))
+        self.bout  = nn.Parameter(torch.zeros(1, 1, device=self.device, dtype=self.dtype))
+
+        # Build the CVXPYLayer (one-step COCP)
+        self._build_cocp_layer()
+
+        # Initial projection to satisfy ICNN nonneg constraints
+        self.project_icnn_parameters()
 
     # ------------------------------------------------------------------
-    # 1. QP-Layer
+    # DPP-safe ICNN weight projection
     # ------------------------------------------------------------------
-    def _build_qp_layer(self):
-        nu = self.nu
+    @torch.no_grad()
+    def project_icnn_parameters(self) -> None:
+        """
+        Enforce nonnegativity on the 'z-path' weights to preserve ICNN-style convexity.
+        """
+        self.W2z.clamp_(min=0.0)
+        self.Woutz.clamp_(min=0.0)
 
-        # Optimization variable
-        u = cp.Variable(nu)
+    # ------------------------------------------------------------------
+    # CVXPY: One-step COCP layer
+    # ------------------------------------------------------------------
+    def _build_cocp_layer(self) -> None:
+        nx, nu, ntheta = self.nx, self.nu, self.ntheta
 
-        # Parameters (MUST be Parameters for DPP)
-        g = cp.Parameter(nu)
-        u_min = cp.Parameter(nu)
-        u_max = cp.Parameter(nu)
+        # Decision variable u (column vector)
+        u = cp.Variable((nu, 1), name="u")
 
-        R_const = cp.Constant(self.R)
+        # Parameters
+        x    = cp.Parameter((nx, 1), name="x")
+        xref = cp.Parameter((nx, 1), name="xref")
+        theta = cp.Parameter((ntheta, 1), name="theta")
+
+        umin = cp.Parameter((nu, 1), name="u_min")
+        umax = cp.Parameter((nu, 1), name="u_max")
+
+        Ad = cp.Parameter((nx, nx), name="Ad")
+        Bd = cp.Parameter((nx, nu), name="Bd")
+        cd = cp.Parameter((nx, 1), name="cd")
         
-        # Objective
-        objective = cp.Minimize(0.5 * cp.quad_form(u, R_const) + g @ u)
+        # ---- LIFT parameters into variables ----
+        xv     = cp.Variable((nx, 1), name="xv")
+        xrefv  = cp.Variable((nx, 1), name="xrefv")
+        thetav = cp.Variable((ntheta, 1), name="thetav")
 
-        # Box constraints (DPP-safe)
+        x_next = cp.Variable((nx, 1), name="x_next")
+
+        s = cp.Variable((2*nx + ntheta, 1), name="s")
+        
+        lift_constraints = [
+            xv == x,
+            xrefv == xref,
+            thetav == theta,
+            x_next == Ad @ xv + Bd @ u + cd,
+            s == cp.vstack([x_next, xrefv, thetav]),
+        ]
+
+
+        # Build ICNN block
+        icnn = CVXICNN2Layer(
+            input_dim=2 * nx + ntheta,
+            h1=self.h1,
+            h2=self.h2,
+            relu_penalty=float(self.cfg.relu_penalty),
+            use_hard_relu_constraints=bool(self.cfg.hard_relu),
+            name="icnn",
+        )
+        cvx_params = icnn.make_parameters()
+        V, cons_icnn, pen_icnn, _ = icnn.build(s, params=cvx_params)
+
+        # Objective: u^T R u + gamma * V + penalty
+        R_const = cp.Constant(self.cfg.R)
+        objective = cp.Minimize(cp.quad_form(u, R_const) + self.gamma * V + pen_icnn)
+
+        # Box constraints
         constraints = [
-            u - u_min >= 0,
-            u_max - u >= 0
+           u >= umin,
+           u <= umax,
+           *lift_constraints,
+           *cons_icnn,
         ]
 
         problem = cp.Problem(objective, constraints)
-        
-        # ---------------- DEBUG PRINTS ----------------
-        print("\n=== QP DEBUG ===")
+
+        # Debug
+        print("\n=== COCP DEBUG ===")
         print("is_dcp:", problem.is_dcp())
         print("is_dpp:", problem.is_dpp())
-        print("is_qp :", problem.is_qp())
         print("num params:", len(problem.parameters()))
-        print("params:", [(p.name(), p.shape) for p in problem.parameters()])
         print("num vars:", len(problem.variables()))
-        print("vars  :", [(v.name(), v.shape) for v in problem.variables()])
-        print("objective:", problem.objective)
-        print("constraints:")
-        for c in problem.constraints:
-            print("  ", c)
 
-        # Optional: isolate which expression breaks DPP
-        try:
-            print("objective expr DCP:", problem.objective.expr.is_dcp())
-            print("objective expr DPP:", problem.objective.expr.is_dpp())
-        except Exception as e:
-            print("Could not query expr.is_dpp():", e)
+        assert problem.is_dpp(), "COCP problem is not DPP – ICNN formulation must be refactored."
 
-        # Build CVXPYLayer
-        self.qp_layer = CvxpyLayer(
+        # Build CvxpyLayer: parameters in the exact order we will pass torch tensors
+        self.cocp_layer = CvxpyLayer(
             problem,
-            parameters=[g, u_min, u_max],
+            parameters=[
+                x, xref, theta, umin, umax, Ad, Bd, cd,
+                cvx_params.W1, cvx_params.b1,
+                cvx_params.W2z, cvx_params.W2x, cvx_params.b2,
+                cvx_params.Woutz, cvx_params.Woutx, cvx_params.bout,
+            ],
             variables=[u],
         )
 
     # ------------------------------------------------------------------
-    # 2. Helpers: Dynamics, Bu, Grad V, g_k
+    # Utilities: shape helpers
     # ------------------------------------------------------------------
-    def dynamics(self, x: Tensor, u: Tensor) -> Tensor:
-        """
-        Wrapper um dynamics_fn. Stellt sicher, dass alles im richtigen dtype/device ist.
-        """
-        return self.dynamics_fn(x, u)
+    def _as_col(self, t: Tensor, dim: int) -> Tensor:
+        t = t.to(self.device, self.dtype)
+        if t.numel() != dim:
+            raise ValueError(f"Expected tensor with {dim} elements, got {t.numel()}.")
+        return t.view(dim, 1)
 
-    def compute_Bu_fast(
-        self,
-        x: Tensor,
-        u_fast: Tensor,
-        tilt_r: Tensor,
-        tilt_l: Tensor,
-    ) -> Tensor:
-        """
-        Compute ∂f/∂u_fast while treating tilt angles as constants.
-        """
-
-        x = x.detach()
-        u_fast = u_fast.detach().requires_grad_(True)
-
-        def f_fast(u_fast_var):
-            u_full = torch.cat(
-                [u_fast_var, tilt_r.view(1), tilt_l.view(1)],
-                dim=0
-            )
-            return self.dynamics(x, u_full)
-
-        Bu_fast = torch.autograd.functional.jacobian(
-            f_fast,
-            u_fast,
-            create_graph=True
-        )  # shape (nx, nu)
-
-        return Bu_fast
-
-    def compute_grad_V(self, x_next: Tensor, x_ref: Tensor) -> Tensor:
-        """
-        Computes ∇_{x'} V(x_next, x_ref; ψ).
-
-        x_next : shape (nx,), must be part of autograd graph
-        x_ref  : shape (nx,), treated as constant
-        """
-
-        # Ensure x_next participates in autograd
-        if not x_next.requires_grad:
-            x_next.requires_grad_(True)
-
-        # x_ref is constant
-        x_ref = x_ref.detach()
-
-        icnn_input = torch.cat([x_next, x_ref], dim=-1)
-        V = self.icnn(icnn_input)  # scalar
-
-        (grad_V_x,) = torch.autograd.grad(
-            V,
-            x_next,
-            create_graph=True,
-            retain_graph=True,
-        )
-
-        return grad_V_x
-
-    def compute_g(
-        self,
-        x: Tensor,
-        u_fast_nominal: Tensor,
-        x_ref: Tensor,
-        tilt_r: Tensor,
-        tilt_l: Tensor,
-    ) -> Tensor:
-        """
-        Compute the linear term g_k = γ * B_u^T ∇_{x'} V
-        for the fast-time-scale inputs only.
-
-        x               : shape (nx,)
-        u_fast_nominal  : shape (nu,)   (nu = 5)
-        x_ref           : shape (nx,)
-        tilt_r, tilt_l  : scalar tensors (exogenous, no gradients)
-
-        g_k             : shape (nu,)
-        """
-        
-        # 0) Build full input vector u = [u_fast, tilt_r, tilt_l]
-        u_full = torch.cat([u_fast_nominal, tilt_r.view(1), tilt_l.view(1)], dim=0)
-        # 1) get next state x'
-        x_next = self.dynamics(x, u_full)
-        
-        # 2) Grad V w.r.t. x'
-        grad_V_x = self.compute_grad_V(x_next, x_ref)  # (nx,)
-
-        # 3) Bu = df/du w.r.t. fast inputs only
-        Bu = self.compute_Bu_fast(x, u_fast=u_fast_nominal, tilt_r=tilt_r, tilt_l=tilt_l)            # (nx, nu)
-
-        # 4) g_k = γ * Bu^T grad_V_x
-        g_k = self.gamma * (Bu.transpose(0, 1) @ grad_V_x)  # (nu,)
-
-        return g_k
+    def _batch(self, t: Tensor) -> Tensor:
+        # cvxpylayers expects leading batch dimension
+        return t.unsqueeze(0)
 
     # ------------------------------------------------------------------
-    # 3. Policy-Forward: x, x_ref -> u*
+    # Theta provider (currently from tilt switcher)
     # ------------------------------------------------------------------
-    def forward_train(self, x: Tensor, x_ref: Tensor,
-                u_nominal: Optional[Tensor] = None) -> Tensor:
+    def _compute_theta(self, x: Tensor) -> Tensor:
         """
-        Differentiable policy evaluation.
-        Used ONLY during training.
+        Compute theta (ntheta,1) from current state x.
+        Right now: theta = [tilt_r, tilt_l]^T (ntheta must be 2).
+        Replace later if theta is something else.
         """
+        if self.ntheta != 2:
+            raise ValueError("Current theta provider outputs 2 elements (tilt_r, tilt_l). Set ntheta=2 or replace _compute_theta().")
 
-        x = x.to(self.device, self.dtype)
-        x_ref = x_ref.to(self.device, self.dtype)
-
-        if u_nominal is None:
-            u_nominal = self.u_nominal_default
-        else:
-            u_nominal = u_nominal.to(self.device, self.dtype)
-
-        # slow tilt dynamics
         d_down = float(x[2].detach().cpu().item())
         tilt_r, tilt_l = self.tilt_switcher.step_ned(d_down, self.dt)
+        theta = torch.tensor([tilt_r, tilt_l], device=self.device, dtype=self.dtype).view(2, 1)
+        return theta
 
-        tilt_r_t = torch.tensor(tilt_r, device=self.device, dtype=self.dtype)
-        tilt_l_t = torch.tensor(tilt_l, device=self.device, dtype=self.dtype)
-
-        # ---- gradient-critical part ----
-        g_k = self.compute_g(
-            x=x,
-            u_fast_nominal=u_nominal,
-            x_ref=x_ref,
-            tilt_r=tilt_r_t,
-            tilt_l=tilt_l_t,
-        )
-
-        # ---- QP solve ----
-        g_in = g_k.unsqueeze(0)
-        u_fast_star_batch, = self.qp_layer(
-            g_in,
-            self.u_min_torch.unsqueeze(0),
-            self.u_max_torch.unsqueeze(0),
-        )
-
-        return u_fast_star_batch.squeeze(0)
-    
-    def forward_eval(self, x: Tensor, x_ref: Tensor,
-                 u_nominal: Optional[Tensor] = None) -> Tensor:
+    # ------------------------------------------------------------------
+    # Forward passes
+    # ------------------------------------------------------------------
+    def forward_train(self, x: Tensor, x_ref: Tensor, u_nominal: Optional[Tensor] = None) -> Tensor:
         """
-        Non-differentiable policy evaluation.
-        Used for rollouts, SPSA, logging.
+        Differentiable policy evaluation (used during training).
+        Returns u* (nu,) torch tensor.
         """
-
-        x = x.to(self.device, self.dtype)
-        x_ref = x_ref.to(self.device, self.dtype)
+        x = self._as_col(x, self.nx)
+        x_ref = self._as_col(x_ref, self.nx)
+        theta = self._compute_theta(x.view(-1))  # uses x as flat for indexing, returns (2,1)
 
         if u_nominal is None:
-            u_nominal = self.u_nominal_default
+            u0 = self.u_nominal_default
         else:
-            u_nominal = u_nominal.to(self.device, self.dtype)
+            u0 = self._as_col(u_nominal, self.nu)
 
-        d_down = float(x[2].item())
-        tilt_r, tilt_l = self.tilt_switcher.step_ned(d_down, self.dt)
+        # Linearize + discretize externally -> numpy arrays
+        Ad_np, Bd_np, cd_np = self.dyn_lin_disc(x.view(-1), u0.view(-1), theta.view(-1))
+        Ad_t = torch.as_tensor(Ad_np, dtype=self.dtype, device=self.device).view(self.nx, self.nx)
+        Bd_t = torch.as_tensor(Bd_np, dtype=self.dtype, device=self.device).view(self.nx, self.nu)
+        cd_t = torch.as_tensor(cd_np, dtype=self.dtype, device=self.device).view(self.nx, 1)
 
-        tilt_r_t = torch.tensor(tilt_r, device=self.device, dtype=self.dtype)
-        tilt_l_t = torch.tensor(tilt_l, device=self.device, dtype=self.dtype)
-        
-        g_k = self.compute_g(
-            x=x,
-            u_fast_nominal=u_nominal,
-            x_ref=x_ref,
-            tilt_r=tilt_r_t,
-            tilt_l=tilt_l_t,
+        # Solve COCP
+        (u_star_batch,) = self.cocp_layer(
+            self._batch(x),
+            self._batch(x_ref),
+            self._batch(theta),
+            self._batch(self.u_min_torch),
+            self._batch(self.u_max_torch),
+            self._batch(Ad_t),
+            self._batch(Bd_t),
+            self._batch(cd_t),
+            self._batch(self.W1),
+            self._batch(self.b1),
+            self._batch(self.W2z),
+            self._batch(self.W2x),
+            self._batch(self.b2),
+            self._batch(self.Woutz),
+            self._batch(self.Woutx),
+            self._batch(self.bout),
         )
 
-        g_k = g_k.detach()
-        
-        g_in = g_k.unsqueeze(0)
-        u_fast_star_batch, = self.qp_layer(
-            g_in,
-            self.u_min_torch.unsqueeze(0),
-            self.u_max_torch.unsqueeze(0),
+        # u_star_batch shape: (1, nu, 1) -> (nu,)
+        return u_star_batch.squeeze(0).squeeze(-1)
+
+    @torch.no_grad()
+    def forward_eval(self, x: Tensor, x_ref: Tensor, u_nominal: Optional[Tensor] = None) -> Tensor:
+        """
+        Non-differentiable policy evaluation (rollouts, SPSA, logging).
+        """
+        x = self._as_col(x, self.nx)
+        x_ref = self._as_col(x_ref, self.nx)
+        theta = self._compute_theta(x.view(-1))
+
+        if u_nominal is None:
+            u0 = self.u_nominal_default
+        else:
+            u0 = self._as_col(u_nominal, self.nu)
+
+        Ad_np, Bd_np, cd_np = self.dyn_lin_disc(x.view(-1), u0.view(-1), theta.view(-1))
+        Ad_t = torch.as_tensor(Ad_np, dtype=self.dtype, device=self.device).view(self.nx, self.nx)
+        Bd_t = torch.as_tensor(Bd_np, dtype=self.dtype, device=self.device).view(self.nx, self.nu)
+        cd_t = torch.as_tensor(cd_np, dtype=self.dtype, device=self.device).view(self.nx, 1)
+
+        (u_star_batch,) = self.cocp_layer(
+            self._batch(x),
+            self._batch(x_ref),
+            self._batch(theta),
+            self._batch(self.u_min_torch),
+            self._batch(self.u_max_torch),
+            self._batch(Ad_t),
+            self._batch(Bd_t),
+            self._batch(cd_t),
+            self._batch(self.W1),
+            self._batch(self.b1),
+            self._batch(self.W2z),
+            self._batch(self.W2x),
+            self._batch(self.b2),
+            self._batch(self.Woutz),
+            self._batch(self.Woutx),
+            self._batch(self.bout),
         )
+        return u_star_batch.squeeze(0).squeeze(-1)
 
-        return u_fast_star_batch.squeeze(0)
-
-    
-    def act_np(self, x_np, xref_np):
-        with torch.no_grad():
-            x_t = torch.tensor(x_np, dtype=torch.float32)
-            xref_t = torch.tensor(xref_np, dtype=torch.float32)
-            u_t = self(x_t, xref_t)
+    def act_np(self, x_np: np.ndarray, xref_np: np.ndarray) -> np.ndarray:
+        """
+        Convenience wrapper for numpy usage (eval mode).
+        """
+        x_t = torch.tensor(x_np, dtype=self.dtype, device=self.device)
+        xref_t = torch.tensor(xref_np, dtype=self.dtype, device=self.device)
+        u_t = self.forward_eval(x_t, xref_t)
         return u_t.cpu().numpy()

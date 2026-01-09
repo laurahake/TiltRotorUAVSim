@@ -11,6 +11,7 @@ import os, sys
 from pathlib import Path
 sys.path.insert(0,os.fspath(Path(__file__).parents[1]))
 import numpy as np
+from scipy.spatial import cKDTree
 import parameters.simulation_parameters as SIM
 import parameters.spline_parameters as SPLP
 from message_types.msg_convert import *
@@ -21,6 +22,21 @@ from planners.trajectory.spline_trajectory import SplineTrajectory
 from planners.trajectory.differential_flatness import DifferentialFlatness
 from message_types.msg_delta import MsgDelta
 from viewers.view_manager import ViewManager
+from tools import rotations 
+
+from datetime import datetime
+
+SAVE_DATA = True
+SAVE_DIR = Path(__file__).resolve().parent / "data_rollouts"
+SAVE_DIR.mkdir(parents=True, exist_ok=True)
+
+RUN_TAG = datetime.now().strftime("%Y%m%d_%H%M%S")
+STATE_DB_PATH = SAVE_DIR / f"state_db_{RUN_TAG}.npy"
+TILT_INDEX_PATH = SAVE_DIR / f"tilt_index_1d_{RUN_TAG}.npz"
+
+IDX_PD = 2
+IDX_TILT_R = 13
+IDX_TILT_L = 14
 
 # initialize elements of the architecture
 wind = np.array([[0., 0., 0., 0., 0., 0.]]).T
@@ -40,6 +56,10 @@ lqr_ctrl = LqrControl(SIM.ts_simulation)
 
 # initialize the simulation time
 sim_time = SIM.start_time
+
+# ---- buffers for logged data ----
+state_log = []   # list of np arrays (15,)
+time_log  = [] 
 
 # main simulation loop
 print("Press Command-Q to exit...")
@@ -63,6 +83,19 @@ while sim_time < SIM.end_time:
     
     #-------update physical system-------------
     vtol.update(delta, wind)  # propagate the MAV dynamics
+    
+    # ---- log states for dataset ----
+    if SAVE_DATA:
+        msg = vtol.true_state
+        pos  = np.asarray(msg.pos).reshape(-1)              # (3,)
+        vel  = np.asarray(msg.vel).reshape(-1)              # (3,)
+        quat = rotations.rotation_to_quaternion(msg.R).reshape(-1)  # (4,)
+        omg  = np.asarray(msg.omega).reshape(-1)            # (3,)
+        tilt = np.asarray(msg.motor_angle).reshape(-1)      # (2,)
+
+        x = np.concatenate([pos, vel, quat, omg, tilt]).astype(np.float32)
+        state_log.append(x)
+        time_log.append(sim_time)
 
     #-------update viewers-------------
     viewers.update(
@@ -76,4 +109,30 @@ while sim_time < SIM.end_time:
     
     #-------increment time-------------
     sim_time += SIM.ts_simulation
+    
+# ---- save dataset + 1D tilt index ----
+X_db = np.stack(state_log, axis=0).astype(np.float32)  # (N,15)
+np.save(STATE_DB_PATH, X_db)
+print(f"[DATA] Saved state DB: {STATE_DB_PATH} with shape {X_db.shape}")
+
+# --- 2D features: height + tilt ---
+h = (-X_db[:, IDX_PD]).astype(np.float32)  # height in meters
+tilt = (0.5 * (X_db[:, IDX_TILT_R] + X_db[:, IDX_TILT_L])).astype(np.float32)
+
+feats = np.stack([h, tilt], axis=1)  # (N,2)
+
+# normalize features
+mu = feats.mean(axis=0)
+sig = feats.std(axis=0) + 1e-8
+feats_n = (feats - mu) / sig
+
+# build KD-tree
+tree = cKDTree(feats_n)
+
+# save everything needed to reuse later
+np.savez(TILT_INDEX_PATH,
+            feats_n=feats_n.astype(np.float32),
+            mu=mu.astype(np.float32),
+            sig=sig.astype(np.float32))
+print(f"[DATA] Saved 2D (height,tilt) index: {TILT_INDEX_PATH} (N={feats_n.shape[0]})")   
 input("Press a key to exit")

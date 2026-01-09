@@ -15,7 +15,7 @@ Tensor = torch.Tensor
 def quaternion_to_rotation_torch(q: Tensor) -> Tensor:
     """
     q = [e0, e1, e2, e3] with scalar-first convention.
-    Returns rotation matrix R (3x3) from body to inertial (same as your numpy helper).
+    Returns rotation matrix R (3x3) from body to inertiaal frame.
     """
     e0, e1, e2, e3 = q[0], q[1], q[2], q[3]
 
@@ -79,7 +79,7 @@ class VtolDynamicsTorch(nn.Module):
         self.gamma7 = torch.tensor(VTOL.gamma7, device=self.device, dtype=self.dtype)
         self.gamma8 = torch.tensor(VTOL.gamma8, device=self.device, dtype=self.dtype)
 
-        # aero/geom constants (same names as in your numpy code)
+        # aero/geom constants
         self.S_wing = torch.tensor(VTOL.S_wing, device=self.device, dtype=self.dtype)
         self.b = torch.tensor(VTOL.b, device=self.device, dtype=self.dtype)
         self.c = torch.tensor(VTOL.c, device=self.device, dtype=self.dtype)

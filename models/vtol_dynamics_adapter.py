@@ -31,14 +31,14 @@ class VtolDynamicsAdapter:
         d.motor_left  = float(u[6])
         return d
 
-    def f_cont_np(self, x, u, wind=None):
+    def f_cont_np(self, x, delta, wind=None):
         if wind is None:
             wind = np.zeros((6,1))
         self.vtol.external_set_state(x.reshape(-1,1))
         self.vtol._update_velocity_data(wind)
-        delta = self._u_to_delta(u)
-        fm = self.vtol._forces_moments(delta)
-        xdot = self.vtol._derivatives(self.vtol._state, fm, delta)
+        u = MsgDelta(delta)
+        fm = self.vtol._forces_moments(u)
+        xdot = self.vtol._derivatives(self.vtol._state, fm, u)
         return xdot.squeeze()
 
     # ---------------- Torch path ----------------

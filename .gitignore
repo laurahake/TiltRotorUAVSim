@@ -9,3 +9,4 @@ plot.py
 *.pt 
 *.pdf
 *.csv
+*.npz

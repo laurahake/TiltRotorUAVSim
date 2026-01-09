@@ -8,7 +8,7 @@ class TiltConfig:
     transition_time_s: float = 3.0     # time to rotate from π/2 to 0
     vertical_angle: float = math.pi/2  # vertical takeoff tilt [rad]
     forward_angle: float  = 0.0        # cruise tilt [rad]
-    angle_min: float = 0.0             # optional safety clamp (adjust to your mechanism)
+    angle_min: float = 0.0             # safety clamp
     angle_max: float = math.radians(115.0)
 
 class TiltState:
