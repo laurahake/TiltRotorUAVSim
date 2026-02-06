@@ -9,7 +9,6 @@ import torch.nn as nn
 import cvxpy as cp
 import math
 from cvxpylayers.torch import CvxpyLayer
-from controllers.tiltrotor_control import TiltRotorSwitcher, TiltConfig
 
 from tools.iccn_value import CVXICNN2Layer, CVXICNN2LayerParams
 
@@ -25,7 +24,7 @@ class PolicyConfig:
     u_min: np.ndarray
     u_max: np.ndarray
     R: np.ndarray               # (nu,nu), PD
-    dt: float                   # time step for tilt switcher
+    Q: np.ndarray               # (nx,nx), PD, position error weight
 
     # ICNN architecture (2-layer)
     h1: int = 64
@@ -81,18 +80,6 @@ class COCPICNNPolicy(nn.Module):
 
         self.dyn_lin_disc = dynamics_linearize_discretize_fn
 
-        # Tilt switcher (theta provider) – replace later
-        tilt_cfg = TiltConfig(
-            trigger_height_m=2.0,
-            hysteresis_m=0.5,
-            transition_time_s=3.0,
-            vertical_angle=math.pi / 2,
-            forward_angle=0.0,
-            angle_min=0.0,
-            angle_max=math.radians(115.0),
-        )
-        self.tilt_switcher = TiltRotorSwitcher(tilt_cfg)
-        self.dt = float(config.dt)
 
         # Buffers: bounds + R
         self.register_buffer("u_min_torch", torch.as_tensor(config.u_min, dtype=self.dtype, device=self.device).view(self.nu, 1))
@@ -194,10 +181,16 @@ class COCPICNNPolicy(nn.Module):
         )
         cvx_params = icnn.make_parameters()
         V, cons_icnn, pen_icnn, _ = icnn.build(s, params=cvx_params)
+        
+        # position stage cost on NEXT state (Option A) ---
+        p_next = x_next[0:3]
+        p_ref  = xrefv[0:3]
+        epos   = p_next - p_ref
+        Qp_pos_const = cp.Constant(self.cfg.Q)
 
         # Objective: u^T R u + gamma * V + penalty
         R_const = cp.Constant(self.cfg.R)
-        objective = cp.Minimize(cp.quad_form(u, R_const) + self.gamma * V + pen_icnn)
+        objective = cp.Minimize(cp.quad_form(epos, Qp_pos_const) + cp.quad_form(u, R_const) + self.gamma * V + pen_icnn)
 
         # Box constraints
         constraints = [
@@ -244,33 +237,15 @@ class COCPICNNPolicy(nn.Module):
         return t.unsqueeze(0)
 
     # ------------------------------------------------------------------
-    # Theta provider (currently from tilt switcher)
-    # ------------------------------------------------------------------
-    def _compute_theta(self, x: Tensor) -> Tensor:
-        """
-        Compute theta (ntheta,1) from current state x.
-        Right now: theta = [tilt_r, tilt_l]^T (ntheta must be 2).
-        Replace later if theta is something else.
-        """
-        if self.ntheta != 2:
-            raise ValueError("Current theta provider outputs 2 elements (tilt_r, tilt_l). Set ntheta=2 or replace _compute_theta().")
-
-        d_down = float(x[2].detach().cpu().item())
-        tilt_r, tilt_l = self.tilt_switcher.step_ned(d_down, self.dt)
-        theta = torch.tensor([tilt_r, tilt_l], device=self.device, dtype=self.dtype).view(2, 1)
-        return theta
-
-    # ------------------------------------------------------------------
     # Forward passes
     # ------------------------------------------------------------------
-    def forward_train(self, x: Tensor, x_ref: Tensor, u_nominal: Optional[Tensor] = None) -> Tensor:
+    def forward_train(self, x: Tensor, x_ref: Tensor, theta, u_nominal: Optional[Tensor] = None) -> Tensor:
         """
         Differentiable policy evaluation (used during training).
         Returns u* (nu,) torch tensor.
         """
         x = self._as_col(x, self.nx)
         x_ref = self._as_col(x_ref, self.nx)
-        theta = self._compute_theta(x.view(-1))  # uses x as flat for indexing, returns (2,1)
 
         if u_nominal is None:
             u0 = self.u_nominal_default
@@ -307,13 +282,12 @@ class COCPICNNPolicy(nn.Module):
         return u_star_batch.squeeze(0).squeeze(-1)
 
     @torch.no_grad()
-    def forward_eval(self, x: Tensor, x_ref: Tensor, u_nominal: Optional[Tensor] = None) -> Tensor:
+    def forward_eval(self, x: Tensor, x_ref: Tensor, theta, u_nominal: Optional[Tensor] = None) -> Tensor:
         """
         Non-differentiable policy evaluation (rollouts, SPSA, logging).
         """
         x = self._as_col(x, self.nx)
         x_ref = self._as_col(x_ref, self.nx)
-        theta = self._compute_theta(x.view(-1))
 
         if u_nominal is None:
             u0 = self.u_nominal_default
