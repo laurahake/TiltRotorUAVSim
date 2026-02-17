@@ -1,6 +1,6 @@
 # TiltRotorUAVSim
 
-This repository is a streamlined version of the [BYU MAGICC vtolsim](https://github.com/byu-magicc/vtolsim) simulator, adapted to demonstrate **State-Dependent LQR Control** for a Tilt-Rotor UAV based on the paper:
+This repository is a streamlined version of the [BYU MAGICC vtolsim](https://github.com/byu-magicc/vtolsim) simulator, adapted to develop a new controller for the Tilt-Rotor UAV Model based on the paper:
 
 > **"State-Dependent LQR Control for a Tilt-Rotor UAV"**  
 > Eren, Serdar; Ehsani, Amirhossein; Beard, Randal W.  
@@ -9,7 +9,7 @@ This repository is a streamlined version of the [BYU MAGICC vtolsim](https://git
 
 ## ✈️ Overview
 
-The goal of this simulation is to reproduce the trajectory tracking performance of a tilt-rotor UAV using the **state-dependent LQR (SD-LQR)** strategy. The model, dynamics, and control structure follow the equations and architecture laid out in the referenced publication.
+Please note that the new controller is still being developed and not functional.
 
 ## 📁 Repository Structure
 
