@@ -19,13 +19,9 @@ from controllers.tiltrotor_control import TiltRotorSwitcher, TiltConfig
 from tools.replay_memory import ReplayBuffer
 from dataclasses import dataclass
 
-
-# ---- Parameters ----
-T_SPSA: int = 400
-r_u: float = 1e-2           # r * ||u||^2
-q_pos: tuple = (1.0, 1.0, 1.0)  # diag(Q) for position error
-gamma: float = 0.99         # discount factor
-
+# ==============================
+# Control Limits
+# ==============================
 u_min = np.array([0.0, 0.0, 0.0, -0.785398, -0.785398], dtype=np.float32)
 u_max = np.array([1.0, 1.0, 1.0,  0.785398,  0.785398], dtype=np.float32)
 idx_fast = [0,1,2,3,4]     # thr_rear, thr_left, thr_right, elevon_left, elevon_right
@@ -119,6 +115,18 @@ def is_valid_state(x_np, xref_np, b: StateBounds):
 
     return True, None
 
+def is_valid_state_with_margin(x, xref, b, margin=0.2):
+    b2 = StateBounds(
+        p_max=b.p_max - margin,
+        v_max=b.v_max - margin,
+        angle_max=b.angle_max - np.deg2rad(5),
+        omega_max=b.omega_max - margin,
+        q_norm_eps=b.q_norm_eps * 0.5,
+        tilt_min=b.tilt_min + np.deg2rad(2),
+        tilt_max=b.tilt_max - np.deg2rad(2),
+    )
+    return is_valid_state(x, xref, b2)
+
 def sample_initial_and_reference_states(K, state_dim=15, rng=None, bounds: StateBounds = None):
     rng = np.random.default_rng() if rng is None else rng
     b = bounds if bounds is not None else StateBounds()
@@ -142,7 +150,7 @@ def sample_initial_and_reference_states(K, state_dim=15, rng=None, bounds: State
         x0[VEL] = 0.0
         x0[QUAT] = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
         x0[RATE] = 0.0
-        x0[TILT] = np.array([0.0, 0.0], dtype=np.float32)
+        x0[TILT] = np.array([1.4544, 1.4544], dtype=np.float32)
 
         pairs.append((x0, xref))
     return pairs
@@ -226,17 +234,8 @@ def Q_hat_trajectory(policy, x0_np, xref_np, u0_override_np,
     
     # 1) Initialize simulation
     vtol = VtolDynamics(dt)
-    vtol.external_set_state(x0_np.reshape(-1, 1))
-
-    tilt_cfg = TiltConfig(trigger_height_m=1.2,
-                              hysteresis_m=0.2,
-                              transition_time_s=2.0,
-                              vertical_angle=math.pi/2,
-                              forward_angle=0.0,
-                              angle_min=0.0,
-                              angle_max=math.radians(115.0))
+    vtol.external_set_state(np.array(x0_np, dtype=np.float32, copy=True).reshape(-1, 1))
     
-    tilt_switcher = TiltRotorSwitcher(tilt_cfg)
     wind = np.zeros((6, 1), dtype=np.float32)
 
     total_return = 0.0
@@ -250,8 +249,8 @@ def Q_hat_trajectory(policy, x0_np, xref_np, u0_override_np,
         xk = vtol._state.reshape(-1)
         
         # ---- Servo angles (tilt rotors) ----
-        d_down = xk[2]
-        tilt_right, tilt_left = tilt_switcher.step_ned(d_down, dt)
+        tilt_right = float(xref_np[13])
+        tilt_left  = float(xref_np[14])
         
         # ---- Build reference state for this step ----
         xref_step = xref_np.copy()
@@ -281,11 +280,14 @@ def Q_hat_trajectory(policy, x0_np, xref_np, u0_override_np,
         if t < T - 1:           # if not last time step
             theta_t = torch.tensor([[tilt_right], [tilt_left]], dtype=torch.float32)  # (2,1)
             # Compute optimal next control
-            u_np = policy.forward_eval(
+            u_next = policy.forward_eval(
                 torch.tensor(xk, dtype=torch.float32),
                 torch.tensor(xref_step, dtype=torch.float32),
-                theta = theta_t
+                theta = theta_t,
+                u_nominal=torch.tensor(u_np, dtype=torch.float32)
             ).cpu().numpy()
+            
+            u_np = u_next
 
     return float(total_return)
 
@@ -334,14 +336,16 @@ def compute_grad_u_spsa(policy, x0_np, xref_np, u_star_np,
 def rollout_and_fill_replay(policy, x0_np, xref_np, replay, bounds, device,
                             T_max=400, dt=SIM.ts_simulation, explore_noise=0.0):
     vtol_ep = VtolDynamics(dt)
-    vtol_ep.external_set_state(x0_np.reshape(-1, 1))
+    vtol_ep.external_set_state(np.array(x0_np, dtype=np.float32, copy=True).reshape(-1, 1))
 
     tilt_cfg = TiltConfig(
-        trigger_height_m=1.2, hysteresis_m=0.2, transition_time_s=2.0,
+        trigger_height_m=3.0, hysteresis_m=0.2, transition_time_s=2.0,
         vertical_angle=math.pi/2, forward_angle=0.0,
         angle_min=0.0, angle_max=math.radians(115.0)
     )
     tilt_switcher = TiltRotorSwitcher(tilt_cfg)
+    
+    u_prev = policy.u_nominal_default.detach().cpu().numpy().reshape(-1).astype(np.float32)
 
     for t in range(T_max):
         xk = vtol_ep._state.reshape(-1).astype(np.float32)
@@ -357,7 +361,7 @@ def rollout_and_fill_replay(policy, x0_np, xref_np, replay, bounds, device,
         done = not valid
 
         theta_np = np.array([tilt_right, tilt_left], dtype=np.float32)
-        replay.store(xk, xref_step, theta_np, done=done, reason=reason)
+        replay.store(xk, xref_step, theta_np, u_prev, done=done, reason=reason)
 
         if done:
             break
@@ -368,6 +372,7 @@ def rollout_and_fill_replay(policy, x0_np, xref_np, replay, bounds, device,
             xref_t = torch.tensor(xref_step, dtype=torch.float32, device=device)
             theta_t = torch.tensor([[tilt_right], [tilt_left]], dtype=torch.float32, device=device)
             u_star = policy.forward_eval(xk_t, xref_t, theta=theta_t).cpu().numpy()
+            u_prev = u_star.astype(np.float32)
 
         if explore_noise > 0.0:
             u_star = np.clip(u_star + explore_noise * np.random.randn(*u_star.shape).astype(np.float32),
@@ -497,7 +502,7 @@ def spsa_train(policy, Qp, R, T_SPSA, T_max = 400, iters=20, K = 5, KSPSA= 2, se
                 num_replay_batches = 1
 
                 for _ in range(num_replay_batches):
-                    xB, xrefB, thetaB, doneB, reasonB = replay.sample(batch_size, rng=rng)
+                    xB, xrefB, thetaB, uPrevB, doneB, reasonB = replay.sample(batch_size, rng=rng)
 
                     episode_loss = 0.0
                     T_k = 0
@@ -514,9 +519,15 @@ def spsa_train(policy, Qp, R, T_SPSA, T_max = 400, iters=20, K = 5, KSPSA= 2, se
                         xk_t = torch.tensor(xk, dtype=torch.float32, device=device)
                         xref_t = torch.tensor(xref_step, dtype=torch.float32, device=device)
                         theta_t = torch.tensor(theta_np.reshape(2, 1), dtype=torch.float32, device=device)  # (2,1)
-
-                        u_star_t = policy.forward_train(xk_t, xref_t, theta=theta_t)
+                        
+                        u_prev_np = uPrevB[i].astype(np.float32)
+                        u_prev_t = torch.tensor(u_prev_np, dtype=torch.float32, device=device)
+                        u_star_t = policy.forward_train(xk_t, xref_t, theta=theta_t, u_nominal=u_prev_t)
                         u_star_np = u_star_t.detach().cpu().numpy()
+                            
+                        valid, _ = is_valid_state_with_margin(xk, xref_step, bounds, margin=0.2)
+                        if not valid:
+                            continue
 
                         # --- SPSA grad_u at replay state ---
                         grad_u_np = compute_grad_u_spsa(
@@ -560,10 +571,10 @@ def spsa_train(policy, Qp, R, T_SPSA, T_max = 400, iters=20, K = 5, KSPSA= 2, se
                 for x0_np, xref_np in sample_initial_and_reference_states(K_eval, rng=rng, bounds=bounds):
                     # Rollout without SPSA/backward, just forward policy in eval mode to get episode cost and length statistics for logging.
                     vtol_ep = VtolDynamics(SIM.ts_simulation)
-                    vtol_ep.external_set_state(x0_np.reshape(-1, 1))
+                    vtol_ep.external_set_state(np.array(x0_np, dtype=np.float32, copy=True).reshape(-1, 1))
 
                     tilt_cfg = TiltConfig(
-                        trigger_height_m=1.2, hysteresis_m=0.2, transition_time_s=2.0,
+                        trigger_height_m=3.0, hysteresis_m=0.2, transition_time_s=2.0,
                         vertical_angle=math.pi/2, forward_angle=0.0,
                         angle_min=0.0, angle_max=math.radians(115.0)
                     )
@@ -749,7 +760,6 @@ def main():
     # Simulation / discretization
     # -----------------------------
     dt = 0.01
-    T_SPSA = 100
     gamma = 0.99
     # -----------------------------
     # Cost matrices
@@ -812,8 +822,8 @@ def main():
         K=2,
         KSPSA=2,
         seed=1,
-        c=0.05,
-        a=1e-5,
+        c=0.1,
+        a=1e-3,
         alpha=0.501,
         A=100,
         gamma=0.99,

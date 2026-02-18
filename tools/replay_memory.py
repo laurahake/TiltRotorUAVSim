@@ -25,9 +25,10 @@ class ReplayBuffer:
     }
     ID_TO_REASON = {v: k for k, v in REASON_TO_ID.items()}
 
-    def __init__(self, max_size: int, nx: int = 15, theta_dim: int = 2, store_reason_as_int: bool = True):
+    def __init__(self, max_size: int, nx: int = 15, nu: int = 5, theta_dim: int = 2, store_reason_as_int: bool = True):
         self.mem_size = int(max_size)
         self.nx = int(nx)
+        self.nu = int(nu)
         self.theta_dim = int(theta_dim)
         self.store_reason_as_int = bool(store_reason_as_int)
 
@@ -37,6 +38,7 @@ class ReplayBuffer:
         self.x_memory = np.zeros((self.mem_size, self.nx), dtype=np.float32)
         self.xref_memory = np.zeros((self.mem_size, self.nx), dtype=np.float32)
         self.theta_memory = np.zeros((self.mem_size, self.theta_dim), dtype=np.float32)
+        self.u_prev_memory = np.zeros((self.mem_size, self.nu), dtype=np.float32)
 
         self.done_memory = np.zeros((self.mem_size,), dtype=np.bool_)
 
@@ -70,7 +72,7 @@ class ReplayBuffer:
         else:
             return str(reason)
 
-    def store(self, x, xref, theta, done: bool, reason=None):
+    def store(self, x, xref, theta, u_prev, done: bool, reason=None):
         """
         Store one sample (x, xref, theta, done, reason).
         """
@@ -79,7 +81,9 @@ class ReplayBuffer:
         x_arr = self._as_float32_1d(x, self.nx, "x")
         xref_arr = self._as_float32_1d(xref, self.nx, "xref")
         theta_arr = self._as_float32_1d(theta, self.theta_dim, "theta")
-
+        u_prev_arr = self._as_float32_1d(u_prev, self.nu, "u_prev")
+        
+        self.u_prev_memory[idx] = u_prev_arr
         self.x_memory[idx] = x_arr
         self.xref_memory[idx] = xref_arr
         self.theta_memory[idx] = theta_arr
@@ -115,6 +119,7 @@ class ReplayBuffer:
             self.x_memory[idxs],
             self.xref_memory[idxs],
             self.theta_memory[idxs],
+            self.u_prev_memory[idxs],
             self.done_memory[idxs],
             self.reason_memory[idxs],
         )

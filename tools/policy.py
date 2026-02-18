@@ -90,7 +90,9 @@ class COCPICNNPolicy(nn.Module):
         self.register_buffer("R_torch", R_t)
 
         # Default linearization input u0
-        self.register_buffer("u_nominal_default", torch.zeros(self.nu, dtype=self.dtype, device=self.device).view(self.nu, 1))
+        #self.register_buffer("u_nominal_default", torch.zeros(self.nu, dtype=self.dtype, device=self.device).view(self.nu, 1))
+        u_hover_guess = torch.tensor([0.5, 0.5, 0.5, 0.0, 0.0], dtype=self.dtype, device=self.device).view(self.nu, 1)
+        self.register_buffer("u_nominal_default", u_hover_guess)
 
         # ----- Trainable ICNN parameters (psi) as torch.nn.Parameter -----
         # These are passed into cvxpylayers as Parameters -> gradients flow into them.
