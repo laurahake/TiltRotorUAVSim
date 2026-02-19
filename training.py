@@ -1,5 +1,7 @@
 import os, sys, random
 from pathlib import Path
+
+from tools import policy
 sys.path.insert(0, os.fspath(Path(__file__).parents[1]))
 
 import numpy as np
@@ -76,7 +78,7 @@ class StateBounds:
     p_max: float = 5.0          # meters (pos error, each axis)
     v_max: float = 5.0          # m/s
     angle_max: float = np.deg2rad(110.0)  # rad
-    omega_max: float = 5.0      # rad/s
+    omega_max: float = 15.0      # rad/s
     q_norm_eps: float = 0.05    # quaternion norm tolerance
     tilt_min: float = 0.0
     tilt_max: float = np.deg2rad(115.0)
@@ -371,7 +373,8 @@ def rollout_and_fill_replay(policy, x0_np, xref_np, replay, bounds, device,
             xk_t = torch.tensor(xk, dtype=torch.float32, device=device)
             xref_t = torch.tensor(xref_step, dtype=torch.float32, device=device)
             theta_t = torch.tensor([[tilt_right], [tilt_left]], dtype=torch.float32, device=device)
-            u_star = policy.forward_eval(xk_t, xref_t, theta=theta_t).cpu().numpy()
+            u_prev_t = torch.tensor(u_prev, dtype=torch.float32, device=device)
+            u_star = policy.forward_eval(xk_t, xref_t, theta=theta_t, u_nominal = u_prev_t).cpu().numpy()
             u_prev = u_star.astype(np.float32)
 
         if explore_noise > 0.0:
@@ -391,7 +394,7 @@ def spsa_train(policy, Qp, R, T_SPSA, T_max = 400, iters=20, K = 5, KSPSA= 2, se
     """
     rng = seed_all(seed)
     
-    bounds = StateBounds(p_max=5.0, v_max=7.0, angle_max=np.deg2rad(110), omega_max=5.0)
+    bounds = StateBounds(p_max=5.0, v_max=7.0, angle_max=np.deg2rad(110), omega_max=15.0)
 
     log_dir = Path("logs")
     log_dir.mkdir(exist_ok=True)
@@ -583,7 +586,7 @@ def spsa_train(policy, Qp, R, T_SPSA, T_max = 400, iters=20, K = 5, KSPSA= 2, se
                     episode_cost = 0.0
                     discount = 1.0
                     T_eval = 0
-
+                    u_prev = policy.u_nominal_default.detach().cpu().numpy().reshape(-1).astype(np.float32)
                     for t in range(T_max):
                         if t == 80 :
                             print("Debug breakpoint: t=85 in eval rollout")
@@ -608,7 +611,9 @@ def spsa_train(policy, Qp, R, T_SPSA, T_max = 400, iters=20, K = 5, KSPSA= 2, se
                             xk_t = torch.tensor(xk, dtype=torch.float32, device=device)
                             xref_t = torch.tensor(xref_step, dtype=torch.float32, device=device)
                             theta_t = torch.tensor([[tilt_right], [tilt_left]], dtype=torch.float32, device=device)
-                            u_star_np = policy.forward_eval(xk_t, xref_t, theta=theta_t).cpu().numpy()
+                            u_prev_t = torch.tensor(u_prev, dtype=torch.float32, device=device)
+                            u_star_np = policy.forward_eval(xk_t, xref_t, theta=theta_t, u_nominal=u_prev_t).cpu().numpy()
+                            u_prev = u_star_np.reshape(-1).astype(np.float32)
 
                         # cost
                         epos = xk[:3] - xref_step[:3]

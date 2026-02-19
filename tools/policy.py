@@ -184,10 +184,10 @@ class COCPICNNPolicy(nn.Module):
         cvx_params = icnn.make_parameters()
         V, cons_icnn, pen_icnn, _ = icnn.build(s, params=cvx_params)
         
-        # position stage cost on NEXT state (Option A) ---
-        p_next = x_next[0:3]
+        # position stage cost on current state
+        p = xv[0:3]
         p_ref  = xrefv[0:3]
-        epos   = p_next - p_ref
+        epos   = p - p_ref
         Qp_pos_const = cp.Constant(self.cfg.Q)
 
         # Objective: u^T R u + gamma * V + penalty
