@@ -32,7 +32,7 @@ idx_fast = [0,1,2,3,4]     # thr_rear, thr_left, thr_right, elevon_left, elevon_
 # ===============================================================
 #  Utility
 # ===============================================================
-def _ckpt_payload(policy, k, extra=None, rng=None):
+def _ckpt_payload(policy, k, extra=None, rng=None, replay=None):
     payload = {
         "iter": int(k),
         "policy_state_dict": policy.state_dict(),
@@ -42,20 +42,27 @@ def _ckpt_payload(policy, k, extra=None, rng=None):
         },
         "timestamp": time.time(),
     }
+
     if rng is not None:
         payload["rng"]["numpy_generator_state"] = rng.bit_generator.state
+
     if torch.cuda.is_available():
         payload["rng"]["torch_cuda"] = torch.cuda.get_rng_state_all()
+
+    if replay is not None:
+        payload["replay"] = replay
+
     if extra:
         payload.update(extra)
+
     return payload
 
-def save_checkpoint(path: Path, policy, k: int, extra=None, rng=None):
+def save_checkpoint(path: Path, policy, k: int, extra=None, rng=None, replay=None):
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(_ckpt_payload(policy, k, extra, rng=rng), path)
+    torch.save(_ckpt_payload(policy, k, extra, rng=rng, replay=replay), path)
 
 def load_checkpoint(path: Path, policy, rng, device="cpu"):
-    ckpt = torch.load(path, map_location=device)
+    ckpt = torch.load(path, map_location=device, weights_only=False)
     policy.load_state_dict(ckpt["policy_state_dict"])
 
     st = ckpt.get("rng", {})
@@ -69,9 +76,10 @@ def load_checkpoint(path: Path, policy, rng, device="cpu"):
 
     if "numpy_generator_state" in st:
         rng.bit_generator.state = st["numpy_generator_state"]
-
+        
+    replay = ckpt.get("replay", None)
     start_iter = int(ckpt.get("iter", -1)) + 1
-    return start_iter, ckpt
+    return start_iter, ckpt, replay
 
 @dataclass
 class StateBounds:
@@ -139,11 +147,12 @@ def sample_initial_and_reference_states(K, state_dim=15, rng=None, bounds: State
     for _ in range(K):
         # --- reference (nominal hover) ---
         xref = np.zeros(state_dim, dtype=np.float32)
+        hover_tilt = np.float32(np.pi/2)
         xref[POS]  = np.array([0.0, 0.0, -1.5], dtype=np.float32)
         xref[VEL]  = 0.0
         xref[QUAT] = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
         xref[RATE] = 0.0
-        xref[TILT] = np.array([1.4544, 1.4544], dtype=np.float32)
+        xref[TILT] = np.array([hover_tilt, hover_tilt], dtype=np.float32)
 
         # --- sample within 2*2 area ---
         x0 = np.zeros(state_dim, dtype=np.float32)
@@ -152,7 +161,7 @@ def sample_initial_and_reference_states(K, state_dim=15, rng=None, bounds: State
         x0[VEL] = 0.0
         x0[QUAT] = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
         x0[RATE] = 0.0
-        x0[TILT] = np.array([1.4544, 1.4544], dtype=np.float32)
+        x0[TILT] = np.array([hover_tilt, hover_tilt], dtype=np.float32)
 
         pairs.append((x0, xref))
     return pairs
@@ -437,10 +446,17 @@ def spsa_train(policy, Qp, R, T_SPSA, T_max = 400, iters=20, K = 5, KSPSA= 2, se
 
     best_loss = float("inf")
     start_k = 0
+    
+    replay = ReplayBuffer(max_size=90000)    # 90k samples
+    min_replay = 5000                        # min size to start training
+    warmup_batch = 10                     # warmup via while len(replay)<min_replay
 
     if latest_ckpt.exists():
-        start_k, ckpt = load_checkpoint(latest_ckpt, policy, rng, device=device)
+        start_k, ckpt, replay_loaded = load_checkpoint(latest_ckpt, policy, rng, device=device)
         best_loss = float(ckpt.get("best_loss", best_loss))
+        if replay_loaded is not None:
+            replay = replay_loaded
+            print(f"[RESUME] loaded replay buffer with size {len(replay)}")
         print(f"[RESUME] loaded {latest_ckpt} -> continuing at iter {start_k}")
         
     fail_count = 0
@@ -452,18 +468,20 @@ def spsa_train(policy, Qp, R, T_SPSA, T_max = 400, iters=20, K = 5, KSPSA= 2, se
         "tilt": 0,
         "quat_norm": 0,
     }
-    
-    replay = ReplayBuffer(max_size=90000)    # 90k samples
-    min_replay = 5000                        # min size to start training
-    warmup_episodes = 75                     # warmup via while len(replay)<min_replay
 
     # ---- Phase 1: Warmup (fill replay) ----
-    filled = 0
-    for (x0_np, xref_np) in sample_initial_and_reference_states(warmup_episodes, rng=rng, bounds=bounds):
-        rollout_and_fill_replay(policy, x0_np, xref_np, replay, bounds=bounds, device=device, T_max=T_max)
-        filled = len(replay)
-        if filled >= min_replay:
-            break
+    filled = len(replay)
+    if filled < min_replay:
+        print(f"[WARMUP] replay size before warmup = {filled}")
+        while filled < min_replay:
+            for (x0_np, xref_np) in sample_initial_and_reference_states(warmup_batch, rng=rng, bounds=bounds):
+                rollout_and_fill_replay(
+                    policy, x0_np, xref_np, replay,
+                    bounds=bounds, device=device, T_max=T_max
+                )
+                filled = len(replay)
+                if filled >= min_replay:
+                    break
 
     print(f"[WARMUP] replay size = {len(replay)}")
     
@@ -732,19 +750,19 @@ def spsa_train(policy, Qp, R, T_SPSA, T_max = 400, iters=20, K = 5, KSPSA= 2, se
             # best checkpoint
             if mean_loss < best_loss:
                 best_loss = mean_loss
-                save_checkpoint(best_ckpt, policy, k, extra={"best_loss": best_loss}, rng=rng)
+                save_checkpoint(best_ckpt, policy, k, extra={"best_loss": best_loss}, rng=rng, replay=replay)
                 
             # latest checkpoint
             if (k % save_every) == 0:
-                save_checkpoint(latest_ckpt, policy, k, extra={"best_loss": best_loss}, rng=rng)
+                save_checkpoint(latest_ckpt, policy, k, extra={"best_loss": best_loss}, rng=rng, replay=replay)
                 
     except KeyboardInterrupt:
         print("\n[INTERRUPT] saving checkpoint...")
-        save_checkpoint(latest_ckpt, policy, k, extra={"best_loss": best_loss}, rng=rng)
+        save_checkpoint(latest_ckpt, policy, k, extra={"best_loss": best_loss}, rng=rng, replay=replay)
         raise
     except Exception as e:
         print(f"\n[ERROR] {e} -> saving checkpoint...")
-        save_checkpoint(latest_ckpt, policy, k, extra={"best_loss": best_loss}, rng=rng)
+        save_checkpoint(latest_ckpt, policy, k, extra={"best_loss": best_loss}, rng=rng, replay=replay)
         raise
 
 
@@ -769,7 +787,18 @@ def main():
     # -----------------------------
     # Cost matrices
     # -----------------------------
-    Qp = np.eye(3, dtype=np.float32) * 10.0
+    Q_diag = np.array(
+    [
+        10, 10, 10,        # position
+        0.5, 0.5, 0.5,     # velocity
+        0.5, 0.5, 0.5, 0.5,# quaternion
+        0.1, 0.1, 0.1,     # angular velocity
+        0.05, 0.05         # tilt angles
+    ],
+    dtype=np.float32
+    )
+
+    Qp = np.diag(Q_diag)
     r_u = 0.1
     R = r_u * np.eye(nu, dtype=np.float32)
 
@@ -823,12 +852,12 @@ def main():
         R=R,
         T_SPSA=100,
         T_max=400,
-        iters=30,
+        iters=31,
         K=2,
         KSPSA=2,
         seed=1,
         c=0.1,
-        a=1e-3,
+        a=1e-4,
         alpha=0.501,
         A=100,
         gamma=0.99,
