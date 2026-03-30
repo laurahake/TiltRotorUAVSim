@@ -155,6 +155,7 @@ def sample_initial_and_reference_states(K, state_dim=15, rng=None, bounds: State
         xref[TILT] = np.array([hover_tilt, hover_tilt], dtype=np.float32)
 
         # --- sample within 2*2 area ---
+        """
         x0 = np.zeros(state_dim, dtype=np.float32)
         x0[0:2] = rng.uniform(-2, 2, size=2).astype(np.float32)
         x0[2] = 0.0
@@ -162,8 +163,9 @@ def sample_initial_and_reference_states(K, state_dim=15, rng=None, bounds: State
         x0[QUAT] = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
         x0[RATE] = 0.0
         x0[TILT] = np.array([hover_tilt, hover_tilt], dtype=np.float32)
+        """
 
-        pairs.append((x0, xref))
+        pairs.append((xref, xref))
     return pairs
 
 def seed_all(seed):
@@ -255,6 +257,8 @@ def Q_hat_trajectory(policy, x0_np, xref_np, u0_override_np,
     # 2) First action: SPSA-perturbed u0
     u_np = u0_override_np.copy()
     
+    discounted_stage_costs = []
+    
     for t in range(T):
         # ---- Current state ----
         xk = vtol._state.reshape(-1)
@@ -274,9 +278,12 @@ def Q_hat_trajectory(policy, x0_np, xref_np, u0_override_np,
             break
 
         # ---- Stage cost ----
-        epos = xk[:3] - xref_step[:3]
-        stage_cost = float(epos.T @ Qp @ epos + u_np @ (R @ u_np))
-        total_return += discount * stage_cost
+        err = xk - xref_step
+        stage_cost = float(err.T @ Qp @ err + u_np @ (R @ u_np))
+        discounted_cost = discount * stage_cost
+
+        total_return += discounted_cost
+        discounted_stage_costs.append(discounted_cost)
         discount *= gamma
         
         # ---- Build control message ----
@@ -300,7 +307,7 @@ def Q_hat_trajectory(policy, x0_np, xref_np, u0_override_np,
             
             u_np = u_next
 
-    return float(total_return)
+    return float(total_return), discounted_stage_costs, len(discounted_stage_costs)
 
 
 # ---- Training Functions ----
@@ -324,17 +331,26 @@ def compute_grad_u_spsa(policy, x0_np, xref_np, u_star_np,
         u_minus = np.clip(u_star_np - c_k * Delta_u, u_min, u_max)
 
         # 3) Evaluate Q_hat(x, u) via Rollouts
-        R_plus = Q_hat_trajectory(
+        R_plus, costs_plus, len_plus = Q_hat_trajectory(
             policy, x0_np, xref_np, u_plus,
             Qp, R, T_SPSA, gamma,
             bounds=bounds
         )
 
-        R_minus = Q_hat_trajectory(
+        R_minus, costs_minus, len_minus = Q_hat_trajectory(
             policy, x0_np, xref_np, u_minus,
             Qp, R, T_SPSA, gamma,
             bounds=bounds
         )
+        
+        # Truncate both to common horizon
+        T_common = min(len_plus, len_minus)
+        if T_common == 0:
+            R_plus = 0.0
+            R_minus = 0.0
+        else:
+            R_plus = float(np.sum(costs_plus[:T_common]))
+            R_minus = float(np.sum(costs_minus[:T_common]))
 
         # 4) SPSA gradient estimate
         grad_u_j = ((R_plus - R_minus) / (2.0 * c_k)) * Delta_u
@@ -634,8 +650,8 @@ def spsa_train(policy, Qp, R, T_SPSA, T_max = 400, iters=20, K = 5, KSPSA= 2, se
                             u_prev = u_star_np.reshape(-1).astype(np.float32)
 
                         # cost
-                        epos = xk[:3] - xref_step[:3]
-                        stage_cost = float(epos.T @ Qp @ epos + u_star_np @ (R @ u_star_np))
+                        err = xk - xref_step
+                        stage_cost = float(err.T @ Qp @ err + u_star_np @ (R @ u_star_np))
                         episode_cost += discount * stage_cost
                         discount *= gamma
 
@@ -789,11 +805,11 @@ def main():
     # -----------------------------
     Q_diag = np.array(
     [
-        10, 10, 10,        # position
-        0.5, 0.5, 0.5,     # velocity
-        0.5, 0.5, 0.5, 0.5,# quaternion
-        0.1, 0.1, 0.1,     # angular velocity
-        0.05, 0.05         # tilt angles
+        10.0, 10.0, 10.0,      # position
+        2.0,  2.0,  2.0,       # velocity
+        1.0,  1.0,  1.0, 1.0,  # quaternion
+        0.5,  0.5,  0.5,       # angular velocity
+        0.05, 0.05             # tilt angles
     ],
     dtype=np.float32
     )
@@ -850,9 +866,9 @@ def main():
         policy=policy,
         Qp=Qp,
         R=R,
-        T_SPSA=100,
+        T_SPSA=10,
         T_max=400,
-        iters=31,
+        iters=20,
         K=2,
         KSPSA=2,
         seed=1,

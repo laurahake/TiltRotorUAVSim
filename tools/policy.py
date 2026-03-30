@@ -42,7 +42,7 @@ class COCPICNNPolicy(nn.Module):
     One-step lookahead convex optimal control policy (COCP) with ICNN value inside CVXPY.
 
     Solves each step:
-        u* = argmin_u  u^T R u + gamma * V_psi( x_next(u), x_ref, theta )
+        u* = argmin_u(p - p_ref)^T Q (p - p_ref) + u^T R u + gamma * V_psi(x_next, x_ref, theta)
         s.t. u_min <= u <= u_max
 
     where x_next(u) = Ad x + Bd u + cd is an affine surrogate (from linearization + discretization).
@@ -184,15 +184,13 @@ class COCPICNNPolicy(nn.Module):
         cvx_params = icnn.make_parameters()
         V, cons_icnn, pen_icnn, _ = icnn.build(s, params=cvx_params)
         
-        # position stage cost on current state
-        p = xv[0:3]
-        p_ref  = xrefv[0:3]
-        epos   = p - p_ref
+        # stage cost on current state
+        err   = xv - xrefv
         Qp_pos_const = cp.Constant(self.cfg.Q)
 
         # Objective: u^T R u + gamma * V + penalty
         R_const = cp.Constant(self.cfg.R)
-        objective = cp.Minimize(cp.quad_form(epos, Qp_pos_const) + cp.quad_form(u, R_const) + self.gamma * V + pen_icnn)
+        objective = cp.Minimize(cp.quad_form(err, Qp_pos_const) + cp.quad_form(u, R_const) + self.gamma * V + pen_icnn)
 
         # Box constraints
         constraints = [
