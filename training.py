@@ -409,6 +409,402 @@ def rollout_and_fill_replay(policy, x0_np, xref_np, replay, bounds, device,
         ctrl = pack_full_controls(u_star, tilt_right, tilt_left)
         vtol_ep.update(MsgDelta(ctrl), np.zeros((6,1), dtype=np.float32))
 
+def collect_training_trajectory(policy, x0_np, xref_np, bounds, device,
+                                T_max=400, dt=SIM.ts_simulation):
+    """
+    Collect one on-policy trajectory until termination or horizon.
+
+    Returns
+    -------
+    traj : list of tuples
+        Each entry is (xk, xref_step, theta_np, u_prev_np), one per valid
+        visited time step.
+    fail_reason : str | None
+        Termination reason if the rollout failed bounds checking.
+    """
+    vtol = VtolDynamics(dt)
+    vtol.external_set_state(np.array(x0_np, dtype=np.float32, copy=True).reshape(-1, 1))
+
+    tilt_cfg = TiltConfig(
+        trigger_height_m=3.0,
+        hysteresis_m=0.2,
+        transition_time_s=2.0,
+        vertical_angle=math.pi/2,
+        forward_angle=0.0,
+        angle_min=0.0,
+        angle_max=math.radians(115.0),
+    )
+    tilt_switcher = TiltRotorSwitcher(tilt_cfg)
+
+    traj = []
+    fail_reason = None
+
+    u_prev = policy.u_nominal_default.detach().cpu().numpy().reshape(-1).astype(np.float32)
+
+    for t in range(T_max):
+        xk = vtol._state.reshape(-1).astype(np.float32)
+
+        d_down = xk[2]
+        tilt_right, tilt_left = tilt_switcher.step_ned(d_down, dt)
+
+        xref_step = xref_np.copy()
+        xref_step[13] = tilt_right
+        xref_step[14] = tilt_left
+
+        valid, reason = is_valid_state(xk, xref_step, bounds)
+        if not valid:
+            fail_reason = reason
+            break
+
+        theta_np = np.array([tilt_right, tilt_left], dtype=np.float32)
+        traj.append((xk.copy(), xref_step.copy(), theta_np.copy(), u_prev.copy()))
+
+        with torch.no_grad():
+            xk_t = torch.tensor(xk, dtype=torch.float32, device=device)
+            xref_t = torch.tensor(xref_step, dtype=torch.float32, device=device)
+            theta_t = torch.tensor(theta_np.reshape(2, 1), dtype=torch.float32, device=device)
+            u_prev_t = torch.tensor(u_prev, dtype=torch.float32, device=device)
+
+            u_star = policy.forward_eval(
+                xk_t,
+                xref_t,
+                theta=theta_t,
+                u_nominal=u_prev_t,
+            ).cpu().numpy()
+
+        ctrl = pack_full_controls(u_star, tilt_right, tilt_left)
+        vtol.update(MsgDelta(ctrl), np.zeros((6, 1), dtype=np.float32))
+
+        u_prev = u_star.astype(np.float32)
+
+    return traj, fail_reason
+
+def spsa_train_formula(policy, Qp, R, T_SPSA, T_max=400, iters=20, K=5, KSPSA=2,
+                       seed=1, c=0.01, a=1e-5, alpha=0.501, A=100,
+                       gamma=0.99, device="cpu"):
+    """
+    Train the ICNN policy 
+
+        (1/K) sum_{k=1}^K [ (1/T_k) sum_{t=1}^{T_k}
+            grad_psi pi_psi(x_{k,t}) * grad_u Q_hat(x_{k,t}, pi_psi(x_{k,t}))
+        ]
+
+    implemented via the surrogate scalar loss
+
+        L = (1/K) sum_k [ (1/T_k) sum_t u_t^T grad_u Q_hat(x_{k,t}, u_t) ]
+
+    where u_t = pi_psi(x_{k,t}) and grad_u Q_hat is approximated with SPSA.
+    """
+    rng = seed_all(seed)
+
+    bounds = StateBounds(
+        p_max=5.0,
+        v_max=7.0,
+        angle_max=np.deg2rad(100),
+        omega_max=15.0,
+    )
+
+    ckpt_dir = Path("logs") / "checkpoints"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    latest_ckpt = ckpt_dir / "latest_formula.pt"
+    best_ckpt = ckpt_dir / "best_formula.pt"
+    save_every = 1
+    
+    log_dir = Path("logs")
+    log_dir.mkdir(exist_ok=True)
+    log_path = log_dir / "train_log_formula.csv"
+    
+    best_loss = float("inf")
+    start_k = 0
+    fail_count = 0
+    fail_reason_counter = {
+        "pos": 0,
+        "vel": 0,
+        "angle": 0,
+        "omega": 0,
+        "tilt": 0,
+        "quat_norm": 0,
+    }
+
+    if latest_ckpt.exists():
+        start_k, ckpt, _ = load_checkpoint(latest_ckpt, policy, rng, device=device)
+        best_loss = float(ckpt.get("best_loss", best_loss))
+        fail_count = int(ckpt.get("fail_count", 0))
+        fail_reason_counter.update(ckpt.get("fail_reason_counter", {}))
+        print(f"[RESUME] continuing from iter {start_k}")
+
+    
+    if (not log_path.exists()) or (start_k == 0):
+        with open(log_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                "iter",
+                "loss_mean",
+                "used_traj",
+                "mean_traj_len",
+                "std_traj_len",
+                "fail_count_total",
+                "fail_pos_total",
+                "fail_vel_total",
+                "fail_angle_total",
+                "fail_omega_total",
+                "fail_tilt_total",
+                "fail_quat_norm_total",
+                "a_k",
+                "c_k",
+                "param_norm",
+                "grad_param_norm",
+                "delta_param_norm_approx",
+                "delta_param_norm_actual",
+                "rel_update_approx",
+                "rel_update_actual",
+                "param_norm_before",
+                "param_norm_after",
+            ])
+
+    try:
+        for k in range(start_k, iters):
+            c_k = c / ((k + 1) ** 0.11)
+            a_k = a / ((k + 1 + A) ** alpha)
+
+            # reset grads
+            for p in policy.parameters():
+                if p.grad is not None:
+                    p.grad.zero_()
+
+            total_loss = 0.0
+            used_traj = 0
+            traj_lengths = []
+
+            # ==========================================================
+            # Outer sum over K trajectories
+            # ==========================================================
+            for x0_np, xref_np in sample_initial_and_reference_states(K, rng=rng, bounds=bounds):
+                traj, fail_reason = collect_training_trajectory(
+                    policy,
+                    x0_np,
+                    xref_np,
+                    bounds=bounds,
+                    device=device,
+                    T_max=T_max,
+                )
+
+                if fail_reason is not None:
+                    fail_count += 1
+                    if fail_reason in fail_reason_counter:
+                        fail_reason_counter[fail_reason] += 1
+
+                T_k = len(traj)
+                if T_k == 0:
+                    continue
+
+                traj_lengths.append(T_k)
+                traj_loss = 0.0
+
+                # ======================================================
+                # Inner sum over t = 1,...,T_k
+                # ======================================================
+                for (xk, xref_step, theta_np, u_prev_np) in traj:
+                    xk_t = torch.tensor(xk, dtype=torch.float32, device=device)
+                    xref_t = torch.tensor(xref_step, dtype=torch.float32, device=device)
+                    theta_t = torch.tensor(theta_np.reshape(2, 1), dtype=torch.float32, device=device)
+                    u_prev_t = torch.tensor(u_prev_np, dtype=torch.float32, device=device)
+
+                    u_star_t = policy.forward_train(
+                        xk_t,
+                        xref_t,
+                        theta=theta_t,
+                        u_nominal=u_prev_t,
+                    )
+                    u_star_np = u_star_t.detach().cpu().numpy()
+
+                    grad_u_np = compute_grad_u_spsa(
+                        policy,
+                        xk,
+                        xref_step,
+                        u_star_np,
+                        Qp,
+                        R,
+                        T_SPSA,
+                        gamma,
+                        c_k,
+                        KSPSA=KSPSA,
+                        rng=rng,
+                        bounds=bounds,
+                    )
+                    grad_u_t = torch.tensor(
+                        grad_u_np,
+                        dtype=u_star_t.dtype,
+                        device=u_star_t.device,
+                    )
+
+                    # surrogate term for chain rule
+                    traj_loss = traj_loss + torch.dot(u_star_t, grad_u_t)
+
+                # average over time steps of this trajectory
+                traj_loss = traj_loss / float(T_k)
+                total_loss = total_loss + traj_loss
+                used_traj += 1
+
+            if used_traj == 0:
+                print(f"[iter {k:03d}] no valid trajectories collected, skipping update")
+                continue
+
+            # average over trajectories
+            total_loss = total_loss / float(used_traj)
+
+            # backward pass
+            total_loss.backward()
+
+            # diagnostics before update
+            with torch.no_grad():
+                params_before = []
+                param_norm_before_sq = 0.0
+                grad_param_norm_sq = 0.0
+
+                for p in policy.parameters():
+                    if not p.requires_grad:
+                        continue
+                    params_before.append(p.detach().clone())
+                    param_norm_before_sq += float(p.data.norm().item() ** 2)
+                    if p.grad is not None:
+                        grad_param_norm_sq += float(p.grad.data.norm().item() ** 2)
+
+                param_norm_before = float(param_norm_before_sq ** 0.5)
+                grad_param_norm = float(grad_param_norm_sq ** 0.5)
+
+                delta_param_norm_approx = float(a_k * grad_param_norm)
+                rel_update_approx = float(delta_param_norm_approx / (param_norm_before + 1e-12))
+
+            # parameter update
+            with torch.no_grad():
+                for p in policy.parameters():
+                    if p.grad is not None:
+                        p -= a_k * p.grad
+            policy.project_icnn_parameters()
+
+            # diagnostics after projection
+            with torch.no_grad():
+                delta_sq = 0.0
+                param_norm_after_sq = 0.0
+                i = 0
+                for p in policy.parameters():
+                    if not p.requires_grad:
+                        continue
+                    dp = p.detach() - params_before[i]
+                    delta_sq += float(dp.norm().item() ** 2)
+                    param_norm_after_sq += float(p.data.norm().item() ** 2)
+                    i += 1
+
+                delta_param_norm_actual = float(delta_sq ** 0.5)
+                param_norm_after = float(param_norm_after_sq ** 0.5)
+                rel_update_actual = float(delta_param_norm_actual / (param_norm_before + 1e-12))
+
+            loss_mean = float(total_loss.item())
+            mean_traj_len = float(np.mean(traj_lengths)) if len(traj_lengths) > 0 else 0.0
+            std_traj_len = float(np.std(traj_lengths)) if len(traj_lengths) > 0 else 0.0
+            param_norm = param_norm_after
+
+            with open(log_path, "a", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    k,
+                    loss_mean,
+                    int(used_traj),
+                    mean_traj_len,
+                    std_traj_len,
+                    fail_count,
+                    fail_reason_counter["pos"],
+                    fail_reason_counter["vel"],
+                    fail_reason_counter["angle"],
+                    fail_reason_counter["omega"],
+                    fail_reason_counter["tilt"],
+                    fail_reason_counter["quat_norm"],
+                    float(a_k),
+                    float(c_k),
+                    float(param_norm),
+                    float(grad_param_norm),
+                    float(delta_param_norm_approx),
+                    float(delta_param_norm_actual),
+                    float(rel_update_approx),
+                    float(rel_update_actual),
+                    float(param_norm_before),
+                    float(param_norm_after),
+                ])
+
+            print(
+                f"[iter {k:03d}] loss={loss_mean:.6f} | "
+                f"used_traj={used_traj}/{K} | "
+                f"mean_T={mean_traj_len:.2f}"
+            )
+            print(
+                f"[iter {k:03d}] fails={fail_count} | "
+                f"pos={fail_reason_counter['pos']} "
+                f"vel={fail_reason_counter['vel']} "
+                f"angle={fail_reason_counter['angle']} "
+                f"omega={fail_reason_counter['omega']} "
+                f"tilt={fail_reason_counter['tilt']}"
+            )
+
+            if loss_mean < best_loss:
+                best_loss = loss_mean
+                save_checkpoint(
+                    best_ckpt,
+                    policy,
+                    k,
+                    extra={
+                        "best_loss": best_loss,
+                        "fail_count": fail_count,
+                        "fail_reason_counter": fail_reason_counter,
+                    },
+                    rng=rng,
+                    replay=None,
+                )
+
+            if (k % save_every) == 0:
+                save_checkpoint(
+                    latest_ckpt,
+                    policy,
+                    k,
+                    extra={
+                        "best_loss": best_loss,
+                        "fail_count": fail_count,
+                        "fail_reason_counter": fail_reason_counter,
+                    },
+                    rng=rng,
+                    replay=None,
+                )
+
+    except KeyboardInterrupt:
+        print("\n[INTERRUPT] saving checkpoint...")
+        save_checkpoint(
+            latest_ckpt,
+            policy,
+            k,
+            extra={
+                        "best_loss": best_loss,
+                        "fail_count": fail_count,
+                        "fail_reason_counter": fail_reason_counter,
+                    },
+            rng=rng,
+            replay=None,
+        )
+        raise
+    except Exception as e:
+        print(f"\n[ERROR] {e} -> saving checkpoint...")
+        save_checkpoint(
+            latest_ckpt,
+            policy,
+            k,
+            extra={
+                        "best_loss": best_loss,
+                        "fail_count": fail_count,
+                        "fail_reason_counter": fail_reason_counter,
+                    },
+            rng=rng,
+            replay=None,
+        )
+        raise
 
 def spsa_train(policy, Qp, R, T_SPSA, T_max = 400, iters=20, K = 5, KSPSA= 2, seed=1,
                c=0.01, a=1e-5, alpha=0.501, A=100, gamma=0.99, device="cpu"):
@@ -766,19 +1162,19 @@ def spsa_train(policy, Qp, R, T_SPSA, T_max = 400, iters=20, K = 5, KSPSA= 2, se
             # best checkpoint
             if mean_loss < best_loss:
                 best_loss = mean_loss
-                save_checkpoint(best_ckpt, policy, k, extra={"best_loss": best_loss}, rng=rng, replay=replay)
+                save_checkpoint(best_ckpt, policy, k, extra={"best_loss": best_loss, "fail_count": fail_count, "fail_reason_counter": fail_reason_counter}, rng=rng, replay=replay)
                 
             # latest checkpoint
             if (k % save_every) == 0:
-                save_checkpoint(latest_ckpt, policy, k, extra={"best_loss": best_loss}, rng=rng, replay=replay)
+                save_checkpoint(latest_ckpt, policy, k, extra={"best_loss": best_loss, "fail_count": fail_count, "fail_reason_counter": fail_reason_counter}, rng=rng, replay=replay)
                 
     except KeyboardInterrupt:
         print("\n[INTERRUPT] saving checkpoint...")
-        save_checkpoint(latest_ckpt, policy, k, extra={"best_loss": best_loss}, rng=rng, replay=replay)
+        save_checkpoint(latest_ckpt, policy, k, extra={"best_loss": best_loss, "fail_count": fail_count, "fail_reason_counter": fail_reason_counter}, rng=rng, replay=replay)
         raise
     except Exception as e:
         print(f"\n[ERROR] {e} -> saving checkpoint...")
-        save_checkpoint(latest_ckpt, policy, k, extra={"best_loss": best_loss}, rng=rng, replay=replay)
+        save_checkpoint(latest_ckpt, policy, k, extra={"best_loss": best_loss, "fail_count": fail_count, "fail_reason_counter": fail_reason_counter}, rng=rng, replay=replay)
         raise
 
 
@@ -805,17 +1201,17 @@ def main():
     # -----------------------------
     Q_diag = np.array(
     [
-        10.0, 10.0, 10.0,      # position
-        2.0,  2.0,  2.0,       # velocity
-        1.0,  1.0,  1.0, 1.0,  # quaternion
-        0.5,  0.5,  0.5,       # angular velocity
+        1.0,  1.0,  1.0,       # position
+        0.9,  0.9,  0.9,       # velocity
+        0.1,  0.1,  0.1, 0.1,  # quaternion
+        0.7,  0.7,  0.7,       # angular velocity
         0.05, 0.05             # tilt angles
     ],
     dtype=np.float32
     )
 
     Qp = np.diag(Q_diag)
-    r_u = 0.1
+    r_u = 0.001
     R = r_u * np.eye(nu, dtype=np.float32)
 
     # -----------------------------
@@ -862,18 +1258,18 @@ def main():
     # -----------------------------
     # SPSA training
     # -----------------------------
-    spsa_train(
+    spsa_train_formula(
         policy=policy,
         Qp=Qp,
         R=R,
         T_SPSA=10,
-        T_max=400,
-        iters=20,
-        K=2,
+        T_max=150,
+        iters=5,
+        K=4,
         KSPSA=2,
         seed=1,
         c=0.1,
-        a=1e-4,
+        a=1e-3,
         alpha=0.501,
         A=100,
         gamma=0.99,
