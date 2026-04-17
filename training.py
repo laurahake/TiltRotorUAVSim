@@ -237,14 +237,19 @@ def _normalize_quat_inplace(x):
 
 def Q_hat_trajectory(policy, x0_np, xref_np, u0_override_np,
                      Qp, R, T=50, gamma=0.99, dt=SIM.ts_simulation,
-                     bounds: StateBounds = None):
+                     bounds: StateBounds = None,
+                     terminal_pos_weight=0.0):
     """
     Simulate trajectory under policy starting from x0_np to approximate
-    our Action-Value function Q_hat(x0, u0_override_np)=∑ γ^t c(x_t, u_t).
+    our Action-Value function
+
+        Q_hat(x0, u0_override_np)
+        = sum_{t=0}^{T-1} gamma^t c(x_t, u_t)
+          + gamma^T * terminal_pos_weight * ||p_T - p_ref||^2
+
+    where p_T is the final valid state position after the rollout.
     """
-    
     b = bounds if bounds is not None else StateBounds()
-    
     # 1) Initialize simulation
     vtol = VtolDynamics(dt)
     vtol.external_set_state(np.array(x0_np, dtype=np.float32, copy=True).reshape(-1, 1))
@@ -258,11 +263,15 @@ def Q_hat_trajectory(policy, x0_np, xref_np, u0_override_np,
     u_np = u0_override_np.copy()
     
     discounted_stage_costs = []
-    
+
+    # keep track of last valid state and reference for terminal cost
+    last_valid_x = None
+    last_valid_xref = None
+
     for t in range(T):
         # ---- Current state ----
-        xk = vtol._state.reshape(-1)
-        
+        xk = vtol._state.reshape(-1).astype(np.float32)
+
         # ---- Servo angles (tilt rotors) ----
         tilt_right = float(xref_np[13])
         tilt_left  = float(xref_np[14])
@@ -277,6 +286,10 @@ def Q_hat_trajectory(policy, x0_np, xref_np, u0_override_np,
         if not valid:
             break
 
+        # current state is valid -> candidate for terminal state
+        last_valid_x = xk.copy()
+        last_valid_xref = xref_step.copy()
+
         # ---- Stage cost ----
         err = xk - xref_step
         stage_cost = float(err.T @ Qp @ err + u_np @ (R @ u_np))
@@ -284,28 +297,40 @@ def Q_hat_trajectory(policy, x0_np, xref_np, u0_override_np,
 
         total_return += discounted_cost
         discounted_stage_costs.append(discounted_cost)
-        discount *= gamma
-        
+
         # ---- Build control message ----
         ctrl = pack_full_controls(u_np, tilt_right, tilt_left)
         delta = MsgDelta(ctrl)
-        wind = np.zeros((6, 1))
+        wind = np.zeros((6, 1), dtype=np.float32)
 
         # ---- Simulate real nonlinear dynamics ----
         vtol.update(delta, wind)
 
+        # advance discount AFTER stage cost
+        discount *= gamma
+
         # ---- Next action via optimal controller ----
-        if t < T - 1:           # if not last time step
-            theta_t = torch.tensor([[tilt_right], [tilt_left]], dtype=torch.float32)  # (2,1)
-            # Compute optimal next control
+        if t < T - 1:
+            x_next = vtol._state.reshape(-1).astype(np.float32)
+
+            theta_t = torch.tensor([[tilt_right], [tilt_left]], dtype=torch.float32)
             u_next = policy.forward_eval(
-                torch.tensor(xk, dtype=torch.float32),
+                torch.tensor(x_next, dtype=torch.float32),
                 torch.tensor(xref_step, dtype=torch.float32),
-                theta = theta_t,
+                theta=theta_t,
                 u_nominal=torch.tensor(u_np, dtype=torch.float32)
             ).cpu().numpy()
-            
-            u_np = u_next
+
+            u_np = u_next.astype(np.float32)
+
+    # ---- Terminal cost on final valid state ----
+    if terminal_pos_weight > 0.0 and last_valid_x is not None:
+        p_T = last_valid_x[0:3]
+        p_ref = last_valid_xref[0:3]
+        terminal_cost = float(terminal_pos_weight * np.sum((p_T - p_ref) ** 2))
+        discounted_terminal_cost = discount * terminal_cost
+        total_return += discounted_terminal_cost
+        discounted_stage_costs.append(discounted_terminal_cost)
 
     return float(total_return), discounted_stage_costs, len(discounted_stage_costs)
 
@@ -313,7 +338,8 @@ def Q_hat_trajectory(policy, x0_np, xref_np, u0_override_np,
 # ---- Training Functions ----
 def compute_grad_u_spsa(policy, x0_np, xref_np, u_star_np, 
                         Qp, R, T_SPSA, gamma, c_k, rng=None, KSPSA=1,
-                        bounds: StateBounds = None):
+                        bounds: StateBounds = None,
+                        terminal_pos_weight=0.0):
     """
     Computes SPSA approximation of ∇_u Q_hat(x0, u_star).
     """
@@ -334,13 +360,15 @@ def compute_grad_u_spsa(policy, x0_np, xref_np, u_star_np,
         R_plus, costs_plus, len_plus = Q_hat_trajectory(
             policy, x0_np, xref_np, u_plus,
             Qp, R, T_SPSA, gamma,
-            bounds=bounds
+            bounds=bounds,
+            terminal_pos_weight=terminal_pos_weight
         )
 
         R_minus, costs_minus, len_minus = Q_hat_trajectory(
             policy, x0_np, xref_np, u_minus,
             Qp, R, T_SPSA, gamma,
-            bounds=bounds
+            bounds=bounds,
+            terminal_pos_weight=terminal_pos_weight
         )
         
         # Truncate both to common horizon
@@ -481,7 +509,7 @@ def collect_training_trajectory(policy, x0_np, xref_np, bounds, device,
 
 def spsa_train_formula(policy, Qp, R, T_SPSA, T_max=400, iters=20, K=5, KSPSA=2,
                        seed=1, c=0.01, a=1e-5, alpha=0.501, A=100,
-                       gamma=0.99, device="cpu"):
+                       gamma=0.99, device="cpu", terminal_pos_weight=0.0):
     """
     Train the ICNN policy 
 
@@ -631,6 +659,7 @@ def spsa_train_formula(policy, Qp, R, T_SPSA, T_max=400, iters=20, K=5, KSPSA=2,
                         KSPSA=KSPSA,
                         rng=rng,
                         bounds=bounds,
+                        terminal_pos_weight=terminal_pos_weight,
                     )
                     grad_u_t = torch.tensor(
                         grad_u_np,
@@ -1274,6 +1303,7 @@ def main():
         A=100,
         gamma=0.99,
         device=device,
+        terminal_pos_weight=50.0,
     )
 
     # -----------------------------
